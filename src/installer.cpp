@@ -32,7 +32,40 @@ void PackageInstaller::safe_remove(const fs::path& p) {
         fs::remove(p, ec);
     }
 }
+void PackageInstaller::run_post_install_script(const fs::path& package_path, const std::string& package_name) {
+    fs::path pkg_json_path = package_path / "package.json";
+    if (!fs::exists(pkg_json_path)) return;
 
+    std::ifstream file(pkg_json_path);
+    json pkg_json;
+    try {
+        file >> pkg_json;
+    } catch (...) {
+        return;
+    }
+
+    if (pkg_json.contains("scripts") && pkg_json["scripts"].contains("postinstall")) {
+        std::string post_cmd = pkg_json["scripts"]["postinstall"].get<std::string>();
+        std::cout << "[Lynx]: Running postinstall script for " << package_name << "...\n";
+
+        fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
+        const char* old_path_c = std::getenv("PATH");
+        std::string old_path = old_path_c ? old_path_c : "";
+
+#ifdef _WIN32
+        std::string path_for_child = bin_dir.string() + ";" + old_path;
+        _putenv_s("PATH", path_for_child.c_str());
+        // Chuyển working directory sang thư mục của package để chạy script
+        std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() + "\" && set \"PATH=" + path_for_child + "\" && " + post_cmd + "\"";
+        std::system(full_cmd.c_str());
+#else
+        std::string path_for_child = bin_dir.string() + ":" + old_path;
+        setenv("PATH", path_for_child.c_str(), 1);
+        std::string full_cmd = "cd \"" + package_path.string() + "\" && " + post_cmd;
+        std::system(full_cmd.c_str());
+#endif
+    }
+}
 bool PackageInstaller::install_single_package(const std::string& raw_input) {
     std::string package_name = raw_input;
     std::string requested_version = "";
@@ -208,6 +241,7 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
             }
 
             generate_bin_shims(project_node_modules, package_name);
+            run_post_install_script(project_node_modules, package_name);
             std::cout << "[Lynx]: Done! " << package_name << "@" << target_version << "\n" << std::flush;
         }
 

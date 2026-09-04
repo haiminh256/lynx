@@ -14,8 +14,18 @@ namespace fs = std::filesystem;
 
 int InstallCommand::execute(const std::vector<std::string>& args) {
     PackageInstaller installer;
+    bool is_dev = false;
+    std::vector<std::string> target_packages;
 
-    if (args.empty()) {
+    for (const auto& arg : args) {
+        if (arg == "-D" || arg == "--save-dev") {
+            is_dev = true;
+        } else {
+            target_packages.push_back(arg);
+        }
+    }
+
+    if (target_packages.empty()) {
         std::string pkg_json_path = "package.json";
         if (!fs::exists(pkg_json_path)) {
             std::cerr << "[Lynx ERROR]: No package.json found in current directory!\n";
@@ -54,17 +64,56 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
             installer.install_packages_parallel(all_targets);
             std::cout << "\n[Lynx]: All packages installed.\n";
         }
-    } else if (args.size() == 1) {
-        installer.install_single_package(args[0]);
     } else {
-        installer.install_packages_parallel(args);
+        if (target_packages.size() == 1) {
+            installer.install_single_package(target_packages[0]);
+        } else {
+            installer.install_packages_parallel(target_packages);
+        }
+
+        std::string pkg_json_path = "package.json";
+        if (fs::exists(pkg_json_path)) {
+            std::ifstream file(pkg_json_path);
+            json pkg_json;
+            try {
+                file >> pkg_json;
+                file.close();
+
+                std::string target_section = is_dev ? "devDependencies" : "dependencies";
+
+                for (const auto& raw_pkg : target_packages) {
+                    std::string pkg_name = raw_pkg;
+                    std::string pkg_ver = "^latest";
+
+                    size_t at_pos = raw_pkg.find('@');
+                    if (at_pos == 0) at_pos = raw_pkg.find('@', 1);
+
+                    if (at_pos != std::string::npos && at_pos > 0) {
+                        pkg_name = raw_pkg.substr(0, at_pos);
+                        pkg_ver = "^" + raw_pkg.substr(at_pos + 1);
+                    }
+
+                    if (g_lockfile.has_package(pkg_name, "")) {
+                        std::map<std::string, std::string> deps = g_lockfile.get_dependencies(pkg_name);
+                    }
+
+                    pkg_json[target_section][pkg_name] = pkg_ver;
+                }
+
+                std::ofstream out_file(pkg_json_path);
+                out_file << pkg_json.dump(2) << std::endl;
+                out_file.close();
+                std::cout << "[Lynx]: Saved to " << target_section << " in package.json\n";
+            } catch (...) {
+                std::cerr << "[Lynx WARNING]: Failed to update package.json\n";
+            }
+        }
     }
 
     g_lockfile.save();
     std::cout << "[Lynx]: Updated lynx-lock.json\n";
     return 0;
 }
-
 int UninstallCommand::execute(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "[Lynx ERROR]: Please specify a package to uninstall!\n";
