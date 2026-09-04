@@ -1,7 +1,7 @@
 CXX      = g++
 CXXFLAGS = -std=c++17 -O2 -Wall -Isrc
 LDFLAGS  = -pthread
-SRCS     = src/main.cpp src/utils.cpp src/install.cpp src/run.cpp src/uninstall.cpp src/create.cpp
+SRCS     = src/app.cpp src/commands.cpp src/installer.cpp src/lockfile.cpp src/main.cpp src/utils.cpp
 OBJS     = $(SRCS:.cpp=.o)
 TARGET   = lynx
 
