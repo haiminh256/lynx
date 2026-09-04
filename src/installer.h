@@ -5,7 +5,7 @@
 #include <filesystem>
 
 namespace fs = std::filesystem;
-// Thêm struct này vào installer_2.cpp
+
 struct TempFileCleaner {
     fs::path filepath;
     ~TempFileCleaner() {

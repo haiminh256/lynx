@@ -50,7 +50,7 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
         fs::path cmd_path = bin_dir / (bin_name + ".cmd");
         std::ofstream cmd_file(cmd_path);
         if (cmd_file.is_open()) {
-            // Định nghĩa đường dẫn node_modules cục bộ và ảo để nạp vào NODE_PATH giống pnpm
+            
             std::string current_nm = (fs::current_path() / "node_modules").string();
             
             cmd_file << "@SETLOCAL\n";

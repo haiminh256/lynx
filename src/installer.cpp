@@ -70,7 +70,7 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
     fs::path project_node_modules = fs::current_path() / "node_modules" / package_name;
     std::error_code ec;
 
-    // Check Lockfile & Disk
+
     if (g_lockfile.has_package(package_name, requested_version) && fs::exists(project_node_modules, ec)) {
         {
             std::lock_guard<std::mutex> lock(install_mutex);
@@ -255,7 +255,7 @@ void PackageInstaller::install_packages_parallel(const std::vector<std::string>&
     jobs.reserve(targets.size());
 
     for (const auto& t : targets) {
-        while ((int)jobs.size() >= LYNX_MAX_PARALLEL) {
+        while (jobs.size() >= get_lynx_max_parallel()) {
             bool progressed = false;
             for (auto it = jobs.begin(); it != jobs.end();) {
                 if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {

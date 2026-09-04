@@ -12,7 +12,6 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// --- InstallCommand ---
 int InstallCommand::execute(const std::vector<std::string>& args) {
     PackageInstaller installer;
 
@@ -66,7 +65,6 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
     return 0;
 }
 
-// --- UninstallCommand ---
 int UninstallCommand::execute(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "[Lynx ERROR]: Please specify a package to uninstall!\n";
@@ -91,7 +89,6 @@ int UninstallCommand::execute(const std::vector<std::string>& args) {
     return 0;
 }
 
-// --- RunCommand ---
 int RunCommand::execute(const std::vector<std::string>& args) {
     std::string pkg_json_path = "package.json";
     if (!fs::exists(pkg_json_path)) {
@@ -147,7 +144,6 @@ int RunCommand::execute(const std::vector<std::string>& args) {
 #endif
 }
 
-// --- CreateCommand ---
 int CreateCommand::execute(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "[Lynx ERROR]: Usage: lynx create <template>[@version]\n";
@@ -158,17 +154,15 @@ int CreateCommand::execute(const std::vector<std::string>& args) {
     std::string pkg_name = raw_input;
     std::string version = "";
 
-    // Tách tên package và version (ví dụ: vite@latest -> pkg_name: vite, version: latest)
     size_t at_pos = raw_input.find('@');
     if (at_pos == 0) {
         at_pos = raw_input.find('@', 1);
     }
     if (at_pos != std::string::npos && at_pos > 0) {
         pkg_name = raw_input.substr(0, at_pos);
-        version = raw_input.substr(at_pos); // Bao gồm cả dấu '@'
+        version = raw_input.substr(at_pos);
     }
 
-    // Thêm tiền tố create- nếu chưa có
     if (pkg_name.rfind("create-", 0) != 0) {
         pkg_name = "create-" + pkg_name;
     }
@@ -181,13 +175,10 @@ int CreateCommand::execute(const std::vector<std::string>& args) {
         return 1;
     }
 
-    // Thực thi file bin của package vừa tải trong node_modules/.bin
     fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
-    
-    // Tên file thực thi trong .bin thường trùng với tên package (hoặc loại bỏ tiền tố create-)
+
     std::string bin_name = pkg_name; 
 
-    // Chuẩn bị tham số truyền tiếp cho CLI (ví dụ: lynx create vite my-app --template vue)
     std::string run_cmd = bin_name;
     for (size_t i = 1; i < args.size(); ++i) {
         run_cmd += " " + args[i];
@@ -208,7 +199,6 @@ int CreateCommand::execute(const std::vector<std::string>& args) {
 #endif
 }
 
-// --- CommandFactory ---
 std::unique_ptr<ICommand> CommandFactory::create_command(const std::string& name) {
     if (name == "install") return std::make_unique<InstallCommand>();
     if (name == "uninstall") return std::make_unique<UninstallCommand>();
