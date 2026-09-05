@@ -11,6 +11,44 @@
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+#ifdef _WIN32
+#include <windows.h>
+
+int run_command_no_batch(const std::string& cmd) {
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi{};
+
+    // Luôn chạy qua cmd.exe vì bin shim của ta là file .cmd
+    std::string full_cmd = "cmd.exe /d /s /c \"" + cmd + "\"";
+
+    BOOL ok = CreateProcessA(
+        nullptr,
+        full_cmd.data(),          // command line
+        nullptr, nullptr,
+        TRUE,                     // inherit handles
+        CREATE_NEW_PROCESS_GROUP, // giúp Ctrl+C sạch hơn
+        nullptr,
+        nullptr,
+        &si, &pi
+    );
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        std::cerr << "[Lynx ERROR]: CreateProcess failed (" << err << ")\n";
+        return 1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return static_cast<int>(exit_code);
+}
+#endif
 
 int InstallCommand::execute(const std::vector<std::string>& args) {
     PackageInstaller installer;
@@ -64,7 +102,7 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
             installer.install_packages_parallel(all_targets);
             std::cout << "\n[Lynx]: All packages installed.\n";
         }
-        installer.run_lifecycle_scripts(fs::current_path(), "root_project");
+        run_lifecycle_scripts(fs::current_path(), "root_project");
     } else {
         if (target_packages.size() == 1) {
             installer.install_single_package(target_packages[0]);
@@ -185,12 +223,15 @@ int RunCommand::execute(const std::vector<std::string>& args) {
 #ifdef _WIN32
     std::string path_for_child = bin_dir.string() + ";" + old_path;
     _putenv_s("PATH", path_for_child.c_str());
-    std::string full_cmd = "cmd /d /s /c \"set \"PATH=" + path_for_child + "\" && " + script_cmd + "\"";
-    return std::system(full_cmd.c_str());
+    int ret = run_command_no_batch(script_cmd);
+    _putenv_s("PATH", old_path.c_str());
+    return ret;
 #else
     std::string path_for_child = bin_dir.string() + ":" + old_path;
     setenv("PATH", path_for_child.c_str(), 1);
-    return std::system(script_cmd.c_str());
+    int ret = std::system(script_cmd.c_str());
+    setenv("PATH", old_path.c_str(), 1);
+    return ret;
 #endif
 }
 
@@ -240,12 +281,15 @@ int CreateCommand::execute(const std::vector<std::string>& args) {
 #ifdef _WIN32
     std::string path_for_child = bin_dir.string() + ";" + old_path;
     _putenv_s("PATH", path_for_child.c_str());
-    std::string full_cmd = "cmd /d /s /c \"set \"PATH=" + path_for_child + "\" && " + run_cmd + "\"";
-    return std::system(full_cmd.c_str());
+    int ret = run_command_no_batch(run_cmd);
+    _putenv_s("PATH", old_path.c_str());
+    return ret;
 #else
     std::string path_for_child = bin_dir.string() + ":" + old_path;
     setenv("PATH", path_for_child.c_str(), 1);
-    return std::system(run_cmd.c_str());
+    int ret = std::system(run_cmd.c_str());
+    setenv("PATH", old_path.c_str(), 1);
+    return ret;
 #endif
 }
 

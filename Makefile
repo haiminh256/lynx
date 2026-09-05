@@ -1,5 +1,5 @@
-CXX      = /usr/bin/g++
-CXXFLAGS = -std=c++17 -O2 -Wall -Isrc
+CXX      = g++
+CXXFLAGS = -std=c++17 -O3 -Wall -Isrc
 LDFLAGS  = -pthread
 SRCS     = src/app.cpp src/commands.cpp src/installer.cpp src/lockfile.cpp src/main.cpp src/utils.cpp
 OBJS     = $(SRCS:.cpp=.o)

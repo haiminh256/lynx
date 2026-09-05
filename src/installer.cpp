@@ -11,6 +11,7 @@
 #include <chrono>
 #include <atomic>
 #include <sstream>
+#include <system_error>
 
 using json = nlohmann::json;
 
@@ -23,68 +24,20 @@ std::string PackageInstaller::make_unique_temp(const std::string& package_name) 
         << n << "_"
         << std::hash<std::thread::id>{}(std::this_thread::get_id())
         << ".json";
-    return oss.str();
+
+    fs::path cache_dir = get_lynx_cache_dir();
+    fs::path temp_path = cache_dir / "tmp" / oss.str();
+
+    std::error_code ec;
+    fs::create_directories(temp_path.parent_path(), ec);
+
+    return temp_path.string();
 }
 
 void PackageInstaller::safe_remove(const fs::path& p) {
     std::error_code ec;
     if (fs::exists(p, ec)) {
         fs::remove(p, ec);
-    }
-}
-
-void PackageInstaller::execute_script(const fs::path& package_path, const std::string& script_type, const std::string& command_str, const std::string& package_name) {
-    {
-        std::lock_guard<std::mutex> lock(install_mutex);
-        std::cout << "[Lynx]: Running " << script_type << " script for " << package_name << "...\n" << std::flush;
-    }
-
-    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
-    const char* old_path_c = std::getenv("PATH");
-    std::string old_path = old_path_c ? old_path_c : "";
-
-#ifdef _WIN32
-    std::string path_for_child = bin_dir.string() + ";" + old_path;
-    _putenv_s("PATH", path_for_child.c_str());
-    std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() + "\" && set \"PATH=" + path_for_child + "\" && " + command_str + "\"";
-    std::system(full_cmd.c_str());
-#else
-    std::string path_for_child = bin_dir.string() + ":" + old_path;
-    setenv("PATH", path_for_child.c_str(), 1);
-    std::string full_cmd = "cd \"" + package_path.string() + "\" && " + command_str;
-    int res = std::system(full_cmd.c_str());
-    (void)res;
-#endif
-}
-
-void PackageInstaller::run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name) {
-    fs::path pkg_json_path = package_path / "package.json";
-    if (!fs::exists(pkg_json_path)) return;
-
-    std::ifstream file(pkg_json_path);
-    json pkg_json;
-    try {
-        file >> pkg_json;
-    } catch (...) {
-        return;
-    }
-
-    if (!pkg_json.contains("scripts") || !pkg_json["scripts"].is_object()) {
-        return;
-    }
-
-    const auto& scripts = pkg_json["scripts"];
-
-    if (scripts.contains("preinstall")) {
-        execute_script(package_path, "preinstall", scripts["preinstall"].get<std::string>(), package_name);
-    }
-
-    if (scripts.contains("install")) {
-        execute_script(package_path, "install", scripts["install"].get<std::string>(), package_name);
-    }
-
-    if (scripts.contains("postinstall")) {
-        execute_script(package_path, "postinstall", scripts["postinstall"].get<std::string>(), package_name);
     }
 }
 
@@ -125,11 +78,11 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
     fs::path project_node_modules = fs::current_path() / "node_modules" / package_name;
     std::error_code ec;
 
-    // Check Lockfile & Disk
+    // Đã có trong lockfile + disk → chỉ cài dependency con
     if (g_lockfile.has_package(package_name, requested_version) && fs::exists(project_node_modules, ec)) {
         {
             std::lock_guard<std::mutex> lock(install_mutex);
-            std::cout << "[Lynx]: Skipping " << package_name 
+            std::cout << "[Lynx]: Skipping " << package_name
                       << " (already in lockfile and node_modules)\n" << std::flush;
         }
 
@@ -154,17 +107,17 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
         "curl -s -L -H \"Accept: application/vnd.npm.install-v1+json\" \"" + url +
         "\" -o \"" + temp_file + "\"";
 
-    std::system(curl_command.c_str());
-
-    if (!fs::exists(temp_file, ec) || fs::file_size(temp_file, ec) == 0) {
+    int curl_ret = std::system(curl_command.c_str());
+    if (curl_ret != 0 || !fs::exists(temp_file, ec) || fs::file_size(temp_file, ec) == 0) {
         std::lock_guard<std::mutex> lock(install_mutex);
-        std::cerr << "[Lynx ERROR]: Network error or package " << package_name << " does not exist!\n";
+        std::cerr << "[Lynx ERROR]: Network error or package " << package_name
+                  << " does not exist! (curl exit=" << curl_ret << ")\n";
         safe_remove(temp_file);
         return false;
     }
 
-    json parsed_data;
     try {
+        json parsed_data;
         {
             std::ifstream file(temp_file);
             if (!file.is_open()) {
@@ -209,82 +162,66 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
         fs::path global_extract_dir =
             cache_dir / "extracted" / (sanitize_filename(package_name) + "_" + target_version);
 
-        if (!fs::exists(global_extract_dir, ec)) {
+        if (!fs::exists(global_extract_dir, ec) || fs::is_empty(global_extract_dir, ec)) {
             if (!fs::exists(target_cache_file, ec) || fs::file_size(target_cache_file, ec) == 0) {
                 {
                     std::lock_guard<std::mutex> lock(install_mutex);
-                    std::cout << "[Lynx]: Fetching " << package_name << "...\n" << std::flush;
+                    std::cout << "[Lynx]: Fetching " << package_name << "@" << target_version << "...\n" << std::flush;
                 }
                 fs::path tmp_tgz = cache_dir / (archive_name + ".part." + std::to_string(g_temp_counter.fetch_add(1)));
                 std::string curl_download_cmd =
                     "curl -s -L \"" + tarball_url + "\" -o \"" + tmp_tgz.string() + "\"";
-                std::system(curl_download_cmd.c_str());
+                int dl_ret = std::system(curl_download_cmd.c_str());
 
-                if (fs::exists(tmp_tgz, ec) && fs::file_size(tmp_tgz, ec) > 0) {
+                if (dl_ret == 0 && fs::exists(tmp_tgz, ec) && fs::file_size(tmp_tgz, ec) > 0) {
                     std::error_code rename_ec;
                     fs::rename(tmp_tgz, target_cache_file, rename_ec);
-                    if (rename_ec) safe_remove(tmp_tgz);
+                    if (rename_ec) {
+                        safe_remove(tmp_tgz);
+                        std::lock_guard<std::mutex> lock(install_mutex);
+                        std::cerr << "[Lynx ERROR]: Rename failed for " << package_name << "\n";
+                        return false;
+                    }
                 } else {
                     safe_remove(tmp_tgz);
                     std::lock_guard<std::mutex> lock(install_mutex);
-                    std::cerr << "[Lynx ERROR]: Download failed for " << package_name << "\n";
+                    std::cerr << "[Lynx ERROR]: Download failed for " << package_name
+                              << " (exit=" << dl_ret << ")\n";
                     return false;
                 }
             }
 
             {
                 std::lock_guard<std::mutex> lock(install_mutex);
-                if (!fs::exists(global_extract_dir, ec)) {
-                    std::cout << "[Lynx]: Extracting " << package_name << "...\n" << std::flush;
-                    fs::create_directories(global_extract_dir, ec);
-                    std::string tar_extract_cmd =
-                        "tar -xf \"" + target_cache_file.string() + "\" -C \"" +
-                        global_extract_dir.string() + "\" --strip-components=1";
-                    std::system(tar_extract_cmd.c_str());
+                if (fs::exists(global_extract_dir, ec)) {
+                    fs::remove_all(global_extract_dir, ec);
+                }
+                fs::create_directories(global_extract_dir, ec);
+
+                std::cout << "[Lynx]: Extracting " << package_name << "...\n" << std::flush;
+                std::string tar_extract_cmd =
+                    "tar -xzf \"" + target_cache_file.string() + "\" -C \"" +
+                    global_extract_dir.string() + "\" --strip-components=1";
+
+                int tar_ret = std::system(tar_extract_cmd.c_str());
+                if (tar_ret != 0) {
+                    std::cerr << "[Lynx ERROR]: tar extract failed for " << package_name
+                              << " (exit=" << tar_ret << "). Is tar installed?\n";
+                    fs::remove_all(global_extract_dir, ec);
+                    return false;
+                }
+
+                if (!fs::exists(global_extract_dir / "package.json", ec) &&
+                    fs::is_empty(global_extract_dir, ec)) {
+                    std::cerr << "[Lynx ERROR]: Extracted directory is empty for "
+                              << package_name << "\n";
+                    fs::remove_all(global_extract_dir, ec);
+                    return false;
                 }
             }
         }
 
-        // installer.cpp (Đoạn cập nhật trong install_single_package)
-
-        std::map<std::string, std::string> dep_map;
-        std::vector<std::string> child_deps;
-
-        // 1. Mandatory dependencies (Luon luon tai)
-        if (current_version_meta.contains("dependencies") && !current_version_meta["dependencies"].empty()) {
-            for (auto& [dep_name, dep_ver] : current_version_meta["dependencies"].items()) {
-                std::string v_str = dep_ver.get<std::string>();
-                dep_map[dep_name] = v_str;
-                child_deps.push_back(dep_name + "@" + v_str);
-            }
-        }
-
-        if (current_version_meta.contains("optionalDependencies") && !current_version_meta["optionalDependencies"].empty()) {
-    for (auto& [opt_name, opt_ver] : current_version_meta["optionalDependencies"].items()) {
-        std::string v_str = opt_ver.get<std::string>();
-
-        // Bỏ qua ngay lập tức nếu tên package chứa kiến trúc không phù hợp (như mips64el, arm, x86...)
-        if (!is_package_name_compatible(opt_name)) {
-            continue; 
-        }
-
-        dep_map[opt_name] = v_str;
-        child_deps.push_back(opt_name + "@" + v_str);
-    }
-}
-
-        // Check platform cua chinh package hien tai
-        if (!is_platform_supported(current_version_meta)) {
-            std::lock_guard<std::mutex> lock(install_mutex);
-            std::cout << "[Lynx]: Skipping " << package_name << " (Unsupported OS/Arch)\n" << std::flush;
-            return true; // Return true de khong coi day la loi khi cai optional dep
-        }
-
-        // Tải các dependency đã được lọc
-        if (!child_deps.empty()) {
-            install_packages_parallel(child_deps);
-        }
-
+        // Copy vào node_modules
         {
             std::lock_guard<std::mutex> lock(install_mutex);
             std::error_code copy_ec;
@@ -302,15 +239,50 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
                 return false;
             }
 
+            if (!fs::exists(project_node_modules / "package.json", ec)) {
+                std::cerr << "[Lynx ERROR]: After copy, package.json missing for "
+                          << package_name << "\n";
+                return false;
+            }
+
             generate_bin_shims(project_node_modules, package_name);
-
-            // Gọi các lifecycle scripts (preinstall -> install -> postinstall)
-            run_lifecycle_scripts(project_node_modules, package_name);
-
             std::cout << "[Lynx]: Done! " << package_name << "@" << target_version << "\n" << std::flush;
         }
 
+        // Lifecycle scripts
+        if (!run_lifecycle_scripts(project_node_modules, package_name)) {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::cerr << "[Lynx WARNING]: Lifecycle scripts failed for " << package_name
+                      << ". Package vẫn được giữ nhưng có thể thiếu binary native.\n";
+        }
+
+        // Ghi lockfile + cài dependency con
+        std::map<std::string, std::string> dep_map;
+        std::vector<std::string> child_deps;
+
+        if (current_version_meta.contains("dependencies") && !current_version_meta["dependencies"].empty()) {
+            for (auto& [dep_name, dep_ver] : current_version_meta["dependencies"].items()) {
+                std::string v_str = dep_ver.get<std::string>();
+                dep_map[dep_name] = v_str;
+                child_deps.push_back(dep_name + "@" + v_str);
+            }
+        }
+
+        if (current_version_meta.contains("optionalDependencies") &&
+            !current_version_meta["optionalDependencies"].empty()) {
+            for (auto& [opt_name, opt_ver] : current_version_meta["optionalDependencies"].items()) {
+                std::string v_str = opt_ver.get<std::string>();
+                dep_map[opt_name] = v_str;
+                child_deps.push_back(opt_name + "@" + v_str);
+            }
+        }
+
         g_lockfile.add_package(package_name, target_version, tarball_url, dep_map);
+
+        if (!child_deps.empty()) {
+            install_packages_parallel(child_deps);
+        }
+
         return true;
 
     } catch (const std::exception& e) {
@@ -319,47 +291,35 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
         std::cerr << "[Lynx ERROR]: Failed for " << package_name << ": " << e.what() << "\n";
         return false;
     }
-    safe_remove(temp_file);
-    return true;
 }
 
 void PackageInstaller::install_packages_parallel(const std::vector<std::string>& targets) {
     if (targets.empty()) return;
 
     std::vector<std::future<bool>> jobs;
-    unsigned int max_threads = get_lynx_max_parallel();
+    jobs.reserve(targets.size());
 
     for (const auto& t : targets) {
-        // 1. Dọn dẹp các job đã chạy xong để giải phóng slot
-        while (true) {
-            for (auto it = jobs.begin(); it != jobs.end(); ) {
+        while ((int)jobs.size() >= LYNX_MAX_PARALLEL) {
+            bool progressed = false;
+            for (auto it = jobs.begin(); it != jobs.end();) {
                 if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
                     try { it->get(); } catch (...) {}
                     it = jobs.erase(it);
+                    progressed = true;
                 } else {
                     ++it;
                 }
             }
-
-            // Nếu còn chỗ trống thì thoát loop để đẩy task mới vào
-            if (jobs.size() < max_threads) {
-                break;
+            if (!progressed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
-
-            // Nghỉ 5ms để tránh chiếm dụng CPU 100% trong khi chờ thread giải phóng
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
-        // 2. Tạo async task cho package mới
-        jobs.push_back(std::async(std::launch::async, [this, t]() {
-            return this->install_single_package(t);
-        }));
+        jobs.push_back(std::async(std::launch::async, &PackageInstaller::install_single_package, this, t));
     }
 
-    // 3. Đợi toàn bộ các task còn lại hoàn tất trước khi thoát hàm
     for (auto& j : jobs) {
-        if (j.valid()) {
-            try { j.get(); } catch (...) {}
-        }
+        try { j.get(); } catch (...) {}
     }
 }

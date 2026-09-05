@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <system_error>
 
 using json = nlohmann::json;
 
@@ -11,24 +12,34 @@ std::set<std::string> installed_packages;
 std::mutex install_mutex;
 
 fs::path get_lynx_cache_dir() {
-    const char* home_dir = std::getenv("USERPROFILE"); // Windows
-    if (!home_dir) {
-        home_dir = std::getenv("HOME"); // Linux / macOS
+    // Cross-platform cache
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
+        fs::path p = fs::path(xdg) / "lynx";
+        std::error_code ec;
+        fs::create_directories(p, ec);
+        return p;
     }
-
-    if (!home_dir) return fs::current_path() / ".lynx_cache";
-    
-    fs::path cache_path = fs::path(home_dir) / ".lynx";
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        fs::path p = fs::path(home) / ".cache" / "lynx";
+        std::error_code ec;
+        fs::create_directories(p, ec);
+        return p;
+    }
+    if (const char* user_profile = std::getenv("USERPROFILE"); user_profile && *user_profile) {
+        fs::path p = fs::path(user_profile) / ".lynx";
+        std::error_code ec;
+        fs::create_directories(p, ec);
+        return p;
+    }
+    fs::path p = fs::current_path() / ".lynx_cache";
     std::error_code ec;
-    if (!fs::exists(cache_path, ec)) {
-        fs::create_directories(cache_path, ec);
-    }
-    return cache_path;
+    fs::create_directories(p, ec);
+    return p;
 }
 
 std::string sanitize_filename(std::string name) {
     for (char& c : name) {
-        if (c == '/' || c == '\\' || c == '@') {
+        if (c == '/' || c == '\\' || c == '@' || c == ':' || c == '*') {
             c = '_';
         }
     }
@@ -56,44 +67,52 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
     fs::create_directories(bin_dir, ec);
 
     auto create_shim = [&](const std::string& bin_name, const std::string& target_rel_path) {
-#ifdef _WIN32
-        // Windows (.cmd shim)
-        fs::path cmd_path = bin_dir / (bin_name + ".cmd");
-        std::ofstream cmd_file(cmd_path);
-        if (cmd_file.is_open()) {
-            std::string current_nm = (fs::current_path() / "node_modules").string();
-            cmd_file << "@SETLOCAL\n";
-            cmd_file << "@IF NOT DEFINED NODE_PATH (\n";
-            cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name << "\\node_modules;" << current_nm << "\"\n";
-            cmd_file << ") ELSE (\n";
-            cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name << "\\node_modules;" << current_nm << ";%NODE_PATH%\"\n";
-            cmd_file << ")\n";
-            cmd_file << "@IF EXIST \"%~dp0\\node.exe\" (\n";
-            cmd_file << "  \"%~dp0\\node.exe\"  \"%~dp0\\..\\" << package_name << "\\" << target_rel_path << "\" %*\n";
-            cmd_file << ") ELSE (\n";
-            cmd_file << "  @SET PATHEXT=%PATHEXT:;.JS;=;%\n";
-            cmd_file << "  node  \"%~dp0\\..\\" << package_name << "\\" << target_rel_path << "\" %*\n";
-            cmd_file << ")\n";
-            cmd_file.close();
+        // Windows .cmd
+        {
+            fs::path cmd_path = bin_dir / (bin_name + ".cmd");
+            std::ofstream cmd_file(cmd_path);
+            if (cmd_file.is_open()) {
+                std::string current_nm = (fs::current_path() / "node_modules").string();
+                cmd_file << "@SETLOCAL\n";
+                cmd_file << "@IF NOT DEFINED NODE_PATH (\n";
+                cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name
+                         << "\\node_modules;" << current_nm << "\"\n";
+                cmd_file << ") ELSE (\n";
+                cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name
+                         << "\\node_modules;" << current_nm << ";%NODE_PATH%\"\n";
+                cmd_file << ")\n";
+                cmd_file << "@IF EXIST \"%~dp0\\node.exe\" (\n";
+                cmd_file << "  \"%~dp0\\node.exe\"  \"%~dp0\\..\\" << package_name << "\\"
+                         << target_rel_path << "\" %*\n";
+                cmd_file << ") ELSE (\n";
+                cmd_file << "  @SET PATHEXT=%PATHEXT:;.JS;=;%\n";
+                cmd_file << "  node  \"%~dp0\\..\\" << package_name << "\\" << target_rel_path
+                         << "\" %*\n";
+                cmd_file << ")\n";
+                cmd_file.close();
+            }
         }
-#else
-        // POSIX / Linux / macOS (Shell script + chmod +x)
-        fs::path sh_path = bin_dir / bin_name;
-        std::ofstream sh_file(sh_path);
-        if (sh_file.is_open()) {
-            std::string current_nm = (fs::current_path() / "node_modules").string();
-            sh_file << "#!/bin/sh\n";
-            sh_file << "basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n";
-            sh_file << "export NODE_PATH=\"" << current_nm << "/" << package_name << "/node_modules:" << current_nm << ":$NODE_PATH\"\n";
-            sh_file << "exec node \"$basedir/../" << package_name << "/" << target_rel_path << "\" \"$@\"\n";
-            sh_file.close();
 
-            // Cấp quyền thực thi rwxr-xr-x (chmod +x)
-            fs::permissions(sh_path,
-                fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec |
-                fs::perms::owner_read | fs::perms::owner_write |
-                fs::perms::group_read | fs::perms::others_read,
-                fs::perm_options::add, ec);
+#ifndef _WIN32
+        // Unix shell script
+        {
+            fs::path sh_path = bin_dir / bin_name;
+            std::ofstream sh_file(sh_path);
+            if (sh_file.is_open()) {
+                std::string current_nm = (fs::current_path() / "node_modules").string();
+                sh_file << "#!/bin/sh\n";
+                sh_file << "basedir=$(dirname \"$(realpath \"$0\" 2>/dev/null || echo \"$0\")\")\n";
+                sh_file << "export NODE_PATH=\"" << current_nm << "/" << package_name
+                        << "/node_modules:" << current_nm << "${NODE_PATH:+:$NODE_PATH}\"\n";
+                sh_file << "exec node \"$basedir/../" << package_name << "/" << target_rel_path
+                        << "\" \"$@\"\n";
+                sh_file.close();
+
+                fs::permissions(sh_path,
+                    fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
+                    fs::perms::others_read | fs::perms::others_exec,
+                    fs::perm_options::add, ec);
+            }
         }
 #endif
     };
@@ -109,129 +128,85 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
         }
     }
 }
-std::string get_current_os() {
-#if defined(_WIN32) || defined(_WIN64)
-    return "win32";
-#elif defined(__APPLE__) || defined(__MACH__)
-    return "darwin";
-#elif defined(__linux__)
-    return "linux";
-#elif defined(__FreeBSD__)
-    return "freebsd";
-#else
-    return "unknown";
-#endif
-}
 
-std::string get_current_arch() {
-#if defined(__x86_64__) || defined(_M_X64)
-    return "x64";
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__i386__) || defined(_M_IX86)
-    return "ia32";
-#elif defined(__arm__) || defined(_M_ARM)
-    return "arm";
-#else
-    return "unknown";
-#endif
-}
+// ====================== LIFECYCLE SCRIPTS ======================
+bool run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name) {
+    fs::path pkg_json_path = package_path / "package.json";
+    if (!fs::exists(pkg_json_path)) return true;
 
-// Kiem tra xem package meta/json co phu hop voi OS & Arch hien tai khong
-bool is_platform_supported(const json& pkg_meta) {
-    std::string current_os = get_current_os();
-    std::string current_arch = get_current_arch();
-
-    // 1. Kiem tra truong "os" trong package.json / metadata
-    if (pkg_meta.contains("os") && pkg_meta["os"].is_array()) {
-        bool os_match = false;
-        bool negated_os = false;
-
-        for (const auto& os_item : pkg_meta["os"]) {
-            std::string os_str = os_item.get<std::string>();
-            if (os_str.rfind("!", 0) == 0) { // Negation (vi du: "!win32")
-                if (os_str.substr(1) == current_os) {
-                    return false; // Bi loai tru truc tiep
-                }
-            } else {
-                negated_os = true;
-                if (os_str == current_os) {
-                    os_match = true;
-                }
-            }
-        }
-        if (negated_os && !os_match) return false;
+    std::ifstream file(pkg_json_path);
+    json pkg_json;
+    try {
+        file >> pkg_json;
+        file.close();
+    } catch (...) {
+        return true; // không có scripts hợp lệ thì bỏ qua
     }
 
-    // 2. Kiem tra truong "cpu" trong package.json / metadata
-    if (pkg_meta.contains("cpu") && pkg_meta["cpu"].is_array()) {
-        bool cpu_match = false;
-        bool negated_cpu = false;
-
-        for (const auto& cpu_item : pkg_meta["cpu"]) {
-            std::string cpu_str = cpu_item.get<std::string>();
-            if (cpu_str.rfind("!", 0) == 0) { // Negation (vi du: "!x64")
-                if (cpu_str.substr(1) == current_arch) {
-                    return false; // Bi loai tru truc tiep
-                }
-            } else {
-                negated_cpu = true;
-                if (cpu_str == current_arch) {
-                    cpu_match = true;
-                }
-            }
-        }
-        if (negated_cpu && !cpu_match) return false;
+    if (!pkg_json.contains("scripts") || !pkg_json["scripts"].is_object()) {
+        return true;
     }
 
-    return true;
-}
-bool is_package_name_compatible(const std::string& pkg_name) {
-    std::string os = get_current_os();
-    std::string arch = get_current_arch();
-
-    const std::vector<std::string> known_oses = {
-        "win32", "darwin", "linux", "freebsd", "openbsd", "netbsd", "aix", "solaris", "sunos", "android", "openharmony"
+    // Thứ tự chuẩn của npm
+    const std::vector<std::string> lifecycle = {
+        "preinstall",
+        "install",
+        "postinstall"
+        // có thể thêm "prepare" nếu muốn
     };
 
-    const std::vector<std::string> known_arches = {
-        "x64", "arm64", "ia32", "arm", "ppc64", "s390x", "riscv64", "loong64", "x86_64"
-    };
+    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
+    const char* old_path_c = std::getenv("PATH");
+    std::string old_path = old_path_c ? old_path_c : "";
 
-    // 1. Kiểm tra OS
-    std::string matched_os = "";
-    for (const auto& o : known_oses) {
-        if (pkg_name.find(o) != std::string::npos) {
-            matched_os = o;
-            break;
+    bool all_ok = true;
+
+    for (const auto& script_name : lifecycle) {
+        if (!pkg_json["scripts"].contains(script_name)) continue;
+
+        std::string script_cmd = pkg_json["scripts"][script_name].get<std::string>();
+        if (script_cmd.empty()) continue;
+
+        {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::cout << "[Lynx]: Running " << script_name << " for " << package_name << "...\n" << std::flush;
         }
-    }
-    if (!matched_os.empty() && matched_os != os) {
-        return false;
-    }
 
-    // 2. Kiểm tra Arch
-    std::string matched_arch = "";
-    for (const auto& a : known_arches) {
-        if (pkg_name.find(a) != std::string::npos) {
-            matched_arch = a;
-            break;
-        }
-    }
-    if (!matched_arch.empty()) {
-        bool arch_matches = (matched_arch == arch) ||
-                             (arch == "x64" && matched_arch == "x86_64");
-        if (!arch_matches) return false;
-    }
+#ifdef _WIN32
+        std::string path_for_child = bin_dir.string() + ";" + old_path;
+        _putenv_s("PATH", path_for_child.c_str());
 
-    // 3. Lọc bỏ gói musl trên các hệ thống Linux glibc (Ubuntu, Debian, Fedora,...)
-    if (os == "linux") {
-        if (pkg_name.find("musl") != std::string::npos) {
-#ifndef __musl__
-            return false;
+        // Chạy trong thư mục của package
+        std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() +
+                               "\" && set \"PATH=" + path_for_child + "\" && " + script_cmd + "\"";
+        int ret = std::system(full_cmd.c_str());
+#else
+        std::string path_for_child = bin_dir.string() + ":" + old_path;
+        setenv("PATH", path_for_child.c_str(), 1);
+
+        // Dùng sh -c để chạy đúng môi trường + cwd
+        std::string full_cmd = "cd \"" + package_path.string() + "\" && " + script_cmd;
+        int ret = std::system(full_cmd.c_str());
 #endif
+
+        if (ret != 0) {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::cerr << "[Lynx ERROR]: " << script_name << " script failed for "
+                      << package_name << " (exit code " << ret << ")\n";
+            all_ok = false;
+            // Có thể break sớm nếu muốn fail-fast
+            // break;
+        } else {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::cout << "[Lynx]: " << script_name << " finished for " << package_name << "\n" << std::flush;
         }
     }
 
-    return true;
+#ifdef _WIN32
+    _putenv_s("PATH", old_path.c_str());
+#else
+    setenv("PATH", old_path.c_str(), 1);
+#endif
+
+    return all_ok;
 }
