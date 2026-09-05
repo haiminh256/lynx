@@ -313,7 +313,7 @@ void PackageInstaller::install_packages_parallel(const std::vector<std::string>&
     jobs.reserve(targets.size());
 
     for (const auto& t : targets) {
-        while ((int)jobs.size() >= LYNX_MAX_PARALLEL) {
+        while (jobs.size() >= get_lynx_max_parallel()) {
             bool progressed = false;
             for (auto it = jobs.begin(); it != jobs.end();) {
                 if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {

@@ -1,4 +1,4 @@
-CXX      = g++
+CXX      = /usr/bin/g++
 CXXFLAGS = -std=c++17 -O2 -Wall -Isrc
 LDFLAGS  = -pthread
 SRCS     = src/app.cpp src/commands.cpp src/installer.cpp src/lockfile.cpp src/main.cpp src/utils.cpp
@@ -17,3 +17,4 @@ src/%.o: src/%.cpp
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+
