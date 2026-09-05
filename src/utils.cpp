@@ -109,3 +109,129 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
         }
     }
 }
+std::string get_current_os() {
+#if defined(_WIN32) || defined(_WIN64)
+    return "win32";
+#elif defined(__APPLE__) || defined(__MACH__)
+    return "darwin";
+#elif defined(__linux__)
+    return "linux";
+#elif defined(__FreeBSD__)
+    return "freebsd";
+#else
+    return "unknown";
+#endif
+}
+
+std::string get_current_arch() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "ia32";
+#elif defined(__arm__) || defined(_M_ARM)
+    return "arm";
+#else
+    return "unknown";
+#endif
+}
+
+// Kiem tra xem package meta/json co phu hop voi OS & Arch hien tai khong
+bool is_platform_supported(const json& pkg_meta) {
+    std::string current_os = get_current_os();
+    std::string current_arch = get_current_arch();
+
+    // 1. Kiem tra truong "os" trong package.json / metadata
+    if (pkg_meta.contains("os") && pkg_meta["os"].is_array()) {
+        bool os_match = false;
+        bool negated_os = false;
+
+        for (const auto& os_item : pkg_meta["os"]) {
+            std::string os_str = os_item.get<std::string>();
+            if (os_str.rfind("!", 0) == 0) { // Negation (vi du: "!win32")
+                if (os_str.substr(1) == current_os) {
+                    return false; // Bi loai tru truc tiep
+                }
+            } else {
+                negated_os = true;
+                if (os_str == current_os) {
+                    os_match = true;
+                }
+            }
+        }
+        if (negated_os && !os_match) return false;
+    }
+
+    // 2. Kiem tra truong "cpu" trong package.json / metadata
+    if (pkg_meta.contains("cpu") && pkg_meta["cpu"].is_array()) {
+        bool cpu_match = false;
+        bool negated_cpu = false;
+
+        for (const auto& cpu_item : pkg_meta["cpu"]) {
+            std::string cpu_str = cpu_item.get<std::string>();
+            if (cpu_str.rfind("!", 0) == 0) { // Negation (vi du: "!x64")
+                if (cpu_str.substr(1) == current_arch) {
+                    return false; // Bi loai tru truc tiep
+                }
+            } else {
+                negated_cpu = true;
+                if (cpu_str == current_arch) {
+                    cpu_match = true;
+                }
+            }
+        }
+        if (negated_cpu && !cpu_match) return false;
+    }
+
+    return true;
+}
+bool is_package_name_compatible(const std::string& pkg_name) {
+    std::string os = get_current_os();
+    std::string arch = get_current_arch();
+
+    const std::vector<std::string> known_oses = {
+        "win32", "darwin", "linux", "freebsd", "openbsd", "netbsd", "aix", "solaris", "sunos", "android", "openharmony"
+    };
+
+    const std::vector<std::string> known_arches = {
+        "x64", "arm64", "ia32", "arm", "ppc64", "s390x", "riscv64", "loong64", "x86_64"
+    };
+
+    // 1. Kiểm tra OS
+    std::string matched_os = "";
+    for (const auto& o : known_oses) {
+        if (pkg_name.find(o) != std::string::npos) {
+            matched_os = o;
+            break;
+        }
+    }
+    if (!matched_os.empty() && matched_os != os) {
+        return false;
+    }
+
+    // 2. Kiểm tra Arch
+    std::string matched_arch = "";
+    for (const auto& a : known_arches) {
+        if (pkg_name.find(a) != std::string::npos) {
+            matched_arch = a;
+            break;
+        }
+    }
+    if (!matched_arch.empty()) {
+        bool arch_matches = (matched_arch == arch) ||
+                             (arch == "x64" && matched_arch == "x86_64");
+        if (!arch_matches) return false;
+    }
+
+    // 3. Lọc bỏ gói musl trên các hệ thống Linux glibc (Ubuntu, Debian, Fedora,...)
+    if (os == "linux") {
+        if (pkg_name.find("musl") != std::string::npos) {
+#ifndef __musl__
+            return false;
+#endif
+        }
+    }
+
+    return true;
+}

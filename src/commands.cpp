@@ -64,6 +64,7 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
             installer.install_packages_parallel(all_targets);
             std::cout << "\n[Lynx]: All packages installed.\n";
         }
+        installer.run_lifecycle_scripts(fs::current_path(), "root_project");
     } else {
         if (target_packages.size() == 1) {
             installer.install_single_package(target_packages[0]);

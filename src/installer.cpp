@@ -52,7 +52,8 @@ void PackageInstaller::execute_script(const fs::path& package_path, const std::s
     std::string path_for_child = bin_dir.string() + ":" + old_path;
     setenv("PATH", path_for_child.c_str(), 1);
     std::string full_cmd = "cd \"" + package_path.string() + "\" && " + command_str;
-    std::system(full_cmd.c_str());
+    int res = std::system(full_cmd.c_str());
+    (void)res;
 #endif
 }
 
@@ -244,9 +245,12 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
             }
         }
 
+        // installer.cpp (Đoạn cập nhật trong install_single_package)
+
         std::map<std::string, std::string> dep_map;
         std::vector<std::string> child_deps;
 
+        // 1. Mandatory dependencies (Luon luon tai)
         if (current_version_meta.contains("dependencies") && !current_version_meta["dependencies"].empty()) {
             for (auto& [dep_name, dep_ver] : current_version_meta["dependencies"].items()) {
                 std::string v_str = dep_ver.get<std::string>();
@@ -256,14 +260,27 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
         }
 
         if (current_version_meta.contains("optionalDependencies") && !current_version_meta["optionalDependencies"].empty()) {
-            for (auto& [opt_name, opt_ver] : current_version_meta["optionalDependencies"].items()) {
-                std::string v_str = opt_ver.get<std::string>();
-                dep_map[opt_name] = v_str;
-                child_deps.push_back(opt_name + "@" + v_str);
-            }
+    for (auto& [opt_name, opt_ver] : current_version_meta["optionalDependencies"].items()) {
+        std::string v_str = opt_ver.get<std::string>();
+
+        // Bỏ qua ngay lập tức nếu tên package chứa kiến trúc không phù hợp (như mips64el, arm, x86...)
+        if (!is_package_name_compatible(opt_name)) {
+            continue; 
         }
 
-        // Tải trước dependencies con để sẵn sàng binary
+        dep_map[opt_name] = v_str;
+        child_deps.push_back(opt_name + "@" + v_str);
+    }
+}
+
+        // Check platform cua chinh package hien tai
+        if (!is_platform_supported(current_version_meta)) {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::cout << "[Lynx]: Skipping " << package_name << " (Unsupported OS/Arch)\n" << std::flush;
+            return true; // Return true de khong coi day la loi khi cai optional dep
+        }
+
+        // Tải các dependency đã được lọc
         if (!child_deps.empty()) {
             install_packages_parallel(child_deps);
         }
@@ -310,29 +327,39 @@ void PackageInstaller::install_packages_parallel(const std::vector<std::string>&
     if (targets.empty()) return;
 
     std::vector<std::future<bool>> jobs;
-    jobs.reserve(targets.size());
+    unsigned int max_threads = get_lynx_max_parallel();
 
     for (const auto& t : targets) {
-        while (jobs.size() >= get_lynx_max_parallel()) {
-            bool progressed = false;
-            for (auto it = jobs.begin(); it != jobs.end();) {
+        // 1. Dọn dẹp các job đã chạy xong để giải phóng slot
+        while (true) {
+            for (auto it = jobs.begin(); it != jobs.end(); ) {
                 if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
                     try { it->get(); } catch (...) {}
                     it = jobs.erase(it);
-                    progressed = true;
                 } else {
                     ++it;
                 }
             }
-            if (!progressed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            // Nếu còn chỗ trống thì thoát loop để đẩy task mới vào
+            if (jobs.size() < max_threads) {
+                break;
             }
+
+            // Nghỉ 5ms để tránh chiếm dụng CPU 100% trong khi chờ thread giải phóng
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
-        jobs.push_back(std::async(std::launch::async, &PackageInstaller::install_single_package, this, t));
+        // 2. Tạo async task cho package mới
+        jobs.push_back(std::async(std::launch::async, [this, t]() {
+            return this->install_single_package(t);
+        }));
     }
 
+    // 3. Đợi toàn bộ các task còn lại hoàn tất trước khi thoát hàm
     for (auto& j : jobs) {
-        try { j.get(); } catch (...) {}
+        if (j.valid()) {
+            try { j.get(); } catch (...) {}
+        }
     }
 }
