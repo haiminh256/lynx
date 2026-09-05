@@ -78,7 +78,6 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
     fs::path project_node_modules = fs::current_path() / "node_modules" / package_name;
     std::error_code ec;
 
-    // Đã có trong lockfile + disk → chỉ cài dependency con
     if (g_lockfile.has_package(package_name, requested_version) && fs::exists(project_node_modules, ec)) {
         {
             std::lock_guard<std::mutex> lock(install_mutex);
@@ -221,42 +220,33 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
             }
         }
 
-        // Copy vào node_modules
         {
             std::lock_guard<std::mutex> lock(install_mutex);
-            std::error_code copy_ec;
-            if (fs::exists(project_node_modules, copy_ec) || fs::is_symlink(project_node_modules, copy_ec)) {
-                fs::remove_all(project_node_modules, copy_ec);
+            std::error_code ec;
+            if (fs::exists(project_node_modules, ec) || fs::is_symlink(project_node_modules, ec)) {
+                fs::remove_all(project_node_modules, ec);
             }
-            fs::create_directories(project_node_modules.parent_path(), copy_ec);
-
-            fs::copy(global_extract_dir, project_node_modules,
-                     fs::copy_options::recursive | fs::copy_options::overwrite_existing, copy_ec);
-
-            if (copy_ec) {
-                std::cerr << "[Lynx ERROR]: Copy failed for " << package_name << "! "
-                          << copy_ec.message() << "\n";
+            bool ok = link_or_copy_directory(global_extract_dir, project_node_modules);
+            if (!ok) {
+                std::cerr << "[Lynx ERROR]: Failed to link/copy " << package_name << "\n";
                 return false;
             }
-
             if (!fs::exists(project_node_modules / "package.json", ec)) {
-                std::cerr << "[Lynx ERROR]: After copy, package.json missing for "
+                std::cerr << "[Lynx ERROR]: After link/copy, package.json missing for "
                           << package_name << "\n";
                 return false;
             }
-
             generate_bin_shims(project_node_modules, package_name);
-            std::cout << "[Lynx]: Done! " << package_name << "@" << target_version << "\n" << std::flush;
+            std::cout << "[Lynx]: Done! " << package_name << "@" << target_version
+                      << " (hard-link)\n" << std::flush;
         }
 
-        // Lifecycle scripts
         if (!run_lifecycle_scripts(project_node_modules, package_name)) {
             std::lock_guard<std::mutex> lock(install_mutex);
             std::cerr << "[Lynx WARNING]: Lifecycle scripts failed for " << package_name
                       << ". Package vẫn được giữ nhưng có thể thiếu binary native.\n";
         }
 
-        // Ghi lockfile + cài dependency con
         std::map<std::string, std::string> dep_map;
         std::vector<std::string> child_deps;
 

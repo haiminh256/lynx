@@ -12,7 +12,6 @@ std::set<std::string> installed_packages;
 std::mutex install_mutex;
 
 fs::path get_lynx_cache_dir() {
-    // Cross-platform cache
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg) {
         fs::path p = fs::path(xdg) / "lynx";
         std::error_code ec;
@@ -67,7 +66,6 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
     fs::create_directories(bin_dir, ec);
 
     auto create_shim = [&](const std::string& bin_name, const std::string& target_rel_path) {
-        // Windows .cmd
         {
             fs::path cmd_path = bin_dir / (bin_name + ".cmd");
             std::ofstream cmd_file(cmd_path);
@@ -94,7 +92,6 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
         }
 
 #ifndef _WIN32
-        // Unix shell script
         {
             fs::path sh_path = bin_dir / bin_name;
             std::ofstream sh_file(sh_path);
@@ -129,7 +126,6 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
     }
 }
 
-// ====================== LIFECYCLE SCRIPTS ======================
 bool run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name) {
     fs::path pkg_json_path = package_path / "package.json";
     if (!fs::exists(pkg_json_path)) return true;
@@ -140,19 +136,18 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         file >> pkg_json;
         file.close();
     } catch (...) {
-        return true; // không có scripts hợp lệ thì bỏ qua
+        return true;
     }
 
     if (!pkg_json.contains("scripts") || !pkg_json["scripts"].is_object()) {
         return true;
     }
 
-    // Thứ tự chuẩn của npm
     const std::vector<std::string> lifecycle = {
         "preinstall",
         "install",
-        "postinstall"
-        // có thể thêm "prepare" nếu muốn
+        "postinstall",
+        "prepare"
     };
 
     fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
@@ -176,7 +171,6 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         std::string path_for_child = bin_dir.string() + ";" + old_path;
         _putenv_s("PATH", path_for_child.c_str());
 
-        // Chạy trong thư mục của package
         std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() +
                                "\" && set \"PATH=" + path_for_child + "\" && " + script_cmd + "\"";
         int ret = std::system(full_cmd.c_str());
@@ -184,7 +178,6 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         std::string path_for_child = bin_dir.string() + ":" + old_path;
         setenv("PATH", path_for_child.c_str(), 1);
 
-        // Dùng sh -c để chạy đúng môi trường + cwd
         std::string full_cmd = "cd \"" + package_path.string() + "\" && " + script_cmd;
         int ret = std::system(full_cmd.c_str());
 #endif
@@ -194,8 +187,6 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
             std::cerr << "[Lynx ERROR]: " << script_name << " script failed for "
                       << package_name << " (exit code " << ret << ")\n";
             all_ok = false;
-            // Có thể break sớm nếu muốn fail-fast
-            // break;
         } else {
             std::lock_guard<std::mutex> lock(install_mutex);
             std::cout << "[Lynx]: " << script_name << " finished for " << package_name << "\n" << std::flush;
@@ -209,4 +200,53 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
 #endif
 
     return all_ok;
+}
+bool hardlink_directory(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+
+    if (!fs::exists(from, ec)) return false;
+    fs::create_directories(to, ec);
+    if (ec) return false;
+
+    for (auto& entry : fs::recursive_directory_iterator(from, fs::directory_options::skip_permission_denied, ec)) {
+        if (ec) return false;
+
+        const auto& src = entry.path();
+        auto rel = fs::relative(src, from, ec);
+        if (ec) return false;
+
+        fs::path dst = to / rel;
+
+        if (entry.is_directory()) {
+            fs::create_directories(dst, ec);
+            if (ec) return false;
+        }
+        else if (entry.is_regular_file()) {
+            if (fs::exists(dst, ec)) {
+                fs::remove(dst, ec);
+            }
+
+            fs::create_hard_link(src, dst, ec);
+            if (ec) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool link_or_copy_directory(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
+
+    if (hardlink_directory(from, to)) {
+        return true;
+    }
+
+    if (fs::exists(to, ec)) {
+        fs::remove_all(to, ec);
+    }
+    fs::create_directories(to.parent_path(), ec);
+
+    fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    return !ec;
 }

@@ -18,15 +18,14 @@ int run_command_no_batch(const std::string& cmd) {
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi{};
 
-    // Luôn chạy qua cmd.exe vì bin shim của ta là file .cmd
     std::string full_cmd = "cmd.exe /d /s /c \"" + cmd + "\"";
 
     BOOL ok = CreateProcessA(
         nullptr,
-        full_cmd.data(),          // command line
+        full_cmd.data(),
         nullptr, nullptr,
-        TRUE,                     // inherit handles
-        CREATE_NEW_PROCESS_GROUP, // giúp Ctrl+C sạch hơn
+        TRUE,
+        CREATE_NEW_PROCESS_GROUP,
         nullptr,
         nullptr,
         &si, &pi
