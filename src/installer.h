@@ -23,10 +23,10 @@ public:
     bool install_single_package(const std::string& raw_input);
     void install_packages_parallel(const std::vector<std::string>& targets);
 
-    // Bổ sung hàm thực thi script postinstall
-    void run_post_install_script(const fs::path& package_path, const std::string& package_name);
+    void run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name);
 
 private:
     std::string make_unique_temp(const std::string& package_name);
     void safe_remove(const fs::path& p);
+    void execute_script(const fs::path& package_path, const std::string& script_type, const std::string& command_str, const std::string& package_name);
 };

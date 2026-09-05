@@ -32,7 +32,31 @@ void PackageInstaller::safe_remove(const fs::path& p) {
         fs::remove(p, ec);
     }
 }
-void PackageInstaller::run_post_install_script(const fs::path& package_path, const std::string& package_name) {
+
+void PackageInstaller::execute_script(const fs::path& package_path, const std::string& script_type, const std::string& command_str, const std::string& package_name) {
+    {
+        std::lock_guard<std::mutex> lock(install_mutex);
+        std::cout << "[Lynx]: Running " << script_type << " script for " << package_name << "...\n" << std::flush;
+    }
+
+    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
+    const char* old_path_c = std::getenv("PATH");
+    std::string old_path = old_path_c ? old_path_c : "";
+
+#ifdef _WIN32
+    std::string path_for_child = bin_dir.string() + ";" + old_path;
+    _putenv_s("PATH", path_for_child.c_str());
+    std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() + "\" && set \"PATH=" + path_for_child + "\" && " + command_str + "\"";
+    std::system(full_cmd.c_str());
+#else
+    std::string path_for_child = bin_dir.string() + ":" + old_path;
+    setenv("PATH", path_for_child.c_str(), 1);
+    std::string full_cmd = "cd \"" + package_path.string() + "\" && " + command_str;
+    std::system(full_cmd.c_str());
+#endif
+}
+
+void PackageInstaller::run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name) {
     fs::path pkg_json_path = package_path / "package.json";
     if (!fs::exists(pkg_json_path)) return;
 
@@ -44,28 +68,25 @@ void PackageInstaller::run_post_install_script(const fs::path& package_path, con
         return;
     }
 
-    if (pkg_json.contains("scripts") && pkg_json["scripts"].contains("postinstall")) {
-        std::string post_cmd = pkg_json["scripts"]["postinstall"].get<std::string>();
-        std::cout << "[Lynx]: Running postinstall script for " << package_name << "...\n";
+    if (!pkg_json.contains("scripts") || !pkg_json["scripts"].is_object()) {
+        return;
+    }
 
-        fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
-        const char* old_path_c = std::getenv("PATH");
-        std::string old_path = old_path_c ? old_path_c : "";
+    const auto& scripts = pkg_json["scripts"];
 
-#ifdef _WIN32
-        std::string path_for_child = bin_dir.string() + ";" + old_path;
-        _putenv_s("PATH", path_for_child.c_str());
-        // Chuyển working directory sang thư mục của package để chạy script
-        std::string full_cmd = "cmd /d /s /c \"cd /d \"" + package_path.string() + "\" && set \"PATH=" + path_for_child + "\" && " + post_cmd + "\"";
-        std::system(full_cmd.c_str());
-#else
-        std::string path_for_child = bin_dir.string() + ":" + old_path;
-        setenv("PATH", path_for_child.c_str(), 1);
-        std::string full_cmd = "cd \"" + package_path.string() + "\" && " + post_cmd;
-        std::system(full_cmd.c_str());
-#endif
+    if (scripts.contains("preinstall")) {
+        execute_script(package_path, "preinstall", scripts["preinstall"].get<std::string>(), package_name);
+    }
+
+    if (scripts.contains("install")) {
+        execute_script(package_path, "install", scripts["install"].get<std::string>(), package_name);
+    }
+
+    if (scripts.contains("postinstall")) {
+        execute_script(package_path, "postinstall", scripts["postinstall"].get<std::string>(), package_name);
     }
 }
+
 bool PackageInstaller::install_single_package(const std::string& raw_input) {
     std::string package_name = raw_input;
     std::string requested_version = "";
@@ -103,7 +124,7 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
     fs::path project_node_modules = fs::current_path() / "node_modules" / package_name;
     std::error_code ec;
 
-
+    // Check Lockfile & Disk
     if (g_lockfile.has_package(package_name, requested_version) && fs::exists(project_node_modules, ec)) {
         {
             std::lock_guard<std::mutex> lock(install_mutex);
@@ -223,28 +244,6 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
             }
         }
 
-        {
-            std::lock_guard<std::mutex> lock(install_mutex);
-            std::error_code copy_ec;
-            if (fs::exists(project_node_modules, copy_ec) || fs::is_symlink(project_node_modules, copy_ec)) {
-                fs::remove_all(project_node_modules, copy_ec);
-            }
-            fs::create_directories(project_node_modules.parent_path(), copy_ec);
-
-            fs::copy(global_extract_dir, project_node_modules,
-                     fs::copy_options::recursive | fs::copy_options::overwrite_existing, copy_ec);
-
-            if (copy_ec) {
-                std::cerr << "[Lynx ERROR]: Copy failed for " << package_name << "! "
-                          << copy_ec.message() << "\n";
-                return false;
-            }
-
-            generate_bin_shims(project_node_modules, package_name);
-            run_post_install_script(project_node_modules, package_name);
-            std::cout << "[Lynx]: Done! " << package_name << "@" << target_version << "\n" << std::flush;
-        }
-
         std::map<std::string, std::string> dep_map;
         std::vector<std::string> child_deps;
 
@@ -264,12 +263,37 @@ bool PackageInstaller::install_single_package(const std::string& raw_input) {
             }
         }
 
-        g_lockfile.add_package(package_name, target_version, tarball_url, dep_map);
-
+        // Tải trước dependencies con để sẵn sàng binary
         if (!child_deps.empty()) {
             install_packages_parallel(child_deps);
         }
 
+        {
+            std::lock_guard<std::mutex> lock(install_mutex);
+            std::error_code copy_ec;
+            if (fs::exists(project_node_modules, copy_ec) || fs::is_symlink(project_node_modules, copy_ec)) {
+                fs::remove_all(project_node_modules, copy_ec);
+            }
+            fs::create_directories(project_node_modules.parent_path(), copy_ec);
+
+            fs::copy(global_extract_dir, project_node_modules,
+                     fs::copy_options::recursive | fs::copy_options::overwrite_existing, copy_ec);
+
+            if (copy_ec) {
+                std::cerr << "[Lynx ERROR]: Copy failed for " << package_name << "! "
+                          << copy_ec.message() << "\n";
+                return false;
+            }
+
+            generate_bin_shims(project_node_modules, package_name);
+
+            // Gọi các lifecycle scripts (preinstall -> install -> postinstall)
+            run_lifecycle_scripts(project_node_modules, package_name);
+
+            std::cout << "[Lynx]: Done! " << package_name << "@" << target_version << "\n" << std::flush;
+        }
+
+        g_lockfile.add_package(package_name, target_version, tarball_url, dep_map);
         return true;
 
     } catch (const std::exception& e) {
@@ -289,7 +313,7 @@ void PackageInstaller::install_packages_parallel(const std::vector<std::string>&
     jobs.reserve(targets.size());
 
     for (const auto& t : targets) {
-        while (jobs.size() >= get_lynx_max_parallel()) {
+        while ((int)jobs.size() >= LYNX_MAX_PARALLEL) {
             bool progressed = false;
             for (auto it = jobs.begin(); it != jobs.end();) {
                 if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
