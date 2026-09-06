@@ -1,5 +1,6 @@
 #include "utils.h"
 #include "json.hpp"
+#include "picosha2.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -126,7 +127,7 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
     }
 }
 
-bool run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name) {
+bool run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name, bool is_root) {
     fs::path pkg_json_path = package_path / "package.json";
     if (!fs::exists(pkg_json_path)) return true;
 
@@ -143,12 +144,12 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         return true;
     }
 
-    const std::vector<std::string> lifecycle = {
-        "preinstall",
-        "install",
-        "postinstall",
-        "prepare"
-    };
+    std::vector<std::string> lifecycle;
+    if (is_root) {
+        lifecycle = {"preinstall", "install", "postinstall", "prepare"};
+    } else {
+        lifecycle = {"install", "postinstall"};
+    }
 
     fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
     const char* old_path_c = std::getenv("PATH");
@@ -201,52 +202,180 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
 
     return all_ok;
 }
-bool hardlink_directory(const fs::path& from, const fs::path& to) {
+
+std::string sha256_file(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return "";
+
+    std::vector<unsigned char> hash(picosha2::k_digest_size);
+    picosha2::hash256(file, hash.begin(), hash.end());
+    return picosha2::bytes_to_hex_string(hash.begin(), hash.end());
+}
+
+fs::path add_to_cas(const fs::path& source_file) {
+    std::string hash = sha256_file(source_file);
+    if (hash.empty()) return {};
+
+    std::string dir2 = hash.substr(0, 2);
+    fs::path store_path = get_lynx_cache_dir() / "store" / dir2 / hash;
+
+    std::error_code ec;
+    if (!fs::exists(store_path, ec)) {
+        fs::create_directories(store_path.parent_path(), ec);
+        fs::copy_file(source_file, store_path, fs::copy_options::overwrite_existing, ec);
+        if (ec) return {};
+
+        fs::permissions(store_path,
+            fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read,
+            fs::perm_options::replace, ec);
+    }
+    return store_path;
+}
+
+bool import_package_to_cas(const fs::path& extracted_dir,
+                           const std::string& pkg_name,
+                           const std::string& version) {
+    std::vector<CasFile> files;
     std::error_code ec;
 
+    for (auto& entry : fs::recursive_directory_iterator(extracted_dir,
+            fs::directory_options::skip_permission_denied, ec)) {
+        if (ec) return false;
+        if (!entry.is_regular_file()) continue;
+
+        fs::path rel = fs::relative(entry.path(), extracted_dir, ec);
+        if (ec) continue;
+
+        fs::path store_path = add_to_cas(entry.path());
+        if (store_path.empty()) {
+            std::cerr << "[Lynx ERROR]: Failed to add to CAS: " << entry.path() << "\n";
+            return false;
+        }
+
+        CasFile cf;
+        cf.relative_path = rel.generic_string();
+        cf.hash = store_path.filename().string();
+        files.push_back(cf);
+    }
+
+    fs::path index_dir = get_lynx_cache_dir() / "index";
+    fs::create_directories(index_dir, ec);
+
+    std::string index_name = sanitize_filename(pkg_name) + "@" + version + ".json";
+    fs::path index_path = index_dir / index_name;
+
+    json j;
+    j["name"] = pkg_name;
+    j["version"] = version;
+    j["files"] = json::array();
+
+    for (const auto& f : files) {
+        j["files"].push_back({
+            {"path", f.relative_path},
+            {"hash", f.hash}
+        });
+    }
+
+    std::ofstream out(index_path);
+    if (!out) return false;
+    out << j.dump(2);
+    return true;
+}
+
+bool is_package_in_cas(const std::string& pkg_name, const std::string& version) {
+    std::string index_name = sanitize_filename(pkg_name) + "@" + version + ".json";
+    fs::path index_path = get_lynx_cache_dir() / "index" / index_name;
+    std::error_code ec;
+    return fs::exists(index_path, ec);
+}
+
+bool materialize_from_cas(const std::string& pkg_name,
+                          const std::string& version,
+                          const fs::path& target_dir) {
+    std::string index_name = sanitize_filename(pkg_name) + "@" + version + ".json";
+    fs::path index_path = get_lynx_cache_dir() / "index" / index_name;
+
+    std::error_code ec;
+    if (!fs::exists(index_path, ec)) {
+        std::cerr << "[Lynx ERROR]: CAS index not found for " << pkg_name << "@" << version << "\n";
+        return false;
+    }
+
+    json j;
+    {
+        std::ifstream in(index_path);
+        if (!in) return false;
+        in >> j;
+    }
+
+    if (fs::exists(target_dir, ec)) {
+        fs::remove_all(target_dir, ec);
+    }
+    fs::create_directories(target_dir, ec);
+
+    for (const auto& item : j["files"]) {
+        std::string rel = item["path"].get<std::string>();
+        std::string hash = item["hash"].get<std::string>();
+
+        fs::path store_file = get_lynx_cache_dir() / "store" / hash.substr(0, 2) / hash;
+        fs::path dest = target_dir / rel;
+
+        fs::create_directories(dest.parent_path(), ec);
+
+        if (fs::exists(dest, ec)) {
+            fs::permissions(dest, fs::perms::owner_write, fs::perm_options::add, ec);
+            fs::remove(dest, ec);
+        }
+
+        ec.clear();
+        fs::create_hard_link(store_file, dest, ec);
+
+        if (ec) {
+            ec.clear();
+            fs::copy_file(store_file, dest, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::cerr << "[Lynx ERROR]: Cannot link/copy " << rel << " (" << ec.message() << ")\n";
+                return false;
+            }
+        }
+
+        fs::permissions(dest, fs::perms::owner_write, fs::perm_options::add, ec);
+    }
+    return true;
+}
+
+bool hardlink_directory(const fs::path& from, const fs::path& to) {
+    std::error_code ec;
     if (!fs::exists(from, ec)) return false;
+
     fs::create_directories(to, ec);
     if (ec) return false;
 
     for (auto& entry : fs::recursive_directory_iterator(from, fs::directory_options::skip_permission_denied, ec)) {
         if (ec) return false;
 
-        const auto& src = entry.path();
-        auto rel = fs::relative(src, from, ec);
+        auto rel = fs::relative(entry.path(), from, ec);
         if (ec) return false;
 
         fs::path dst = to / rel;
 
         if (entry.is_directory()) {
             fs::create_directories(dst, ec);
+        } else if (entry.is_regular_file()) {
+            if (fs::exists(dst, ec)) fs::remove(dst, ec);
+            fs::create_hard_link(entry.path(), dst, ec);
             if (ec) return false;
-        }
-        else if (entry.is_regular_file()) {
-            if (fs::exists(dst, ec)) {
-                fs::remove(dst, ec);
-            }
-
-            fs::create_hard_link(src, dst, ec);
-            if (ec) {
-                return false;
-            }
         }
     }
     return true;
 }
 
 bool link_or_copy_directory(const fs::path& from, const fs::path& to) {
+    if (hardlink_directory(from, to)) return true;
+
     std::error_code ec;
-
-    if (hardlink_directory(from, to)) {
-        return true;
-    }
-
-    if (fs::exists(to, ec)) {
-        fs::remove_all(to, ec);
-    }
+    if (fs::exists(to, ec)) fs::remove_all(to, ec);
     fs::create_directories(to.parent_path(), ec);
-
     fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
     return !ec;
 }

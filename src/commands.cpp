@@ -11,6 +11,7 @@
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
 #ifdef _WIN32
 #include <windows.h>
 
@@ -25,15 +26,14 @@ int run_command_no_batch(const std::string& cmd) {
         full_cmd.data(),
         nullptr, nullptr,
         TRUE,
-        CREATE_NEW_PROCESS_GROUP,
+        0,
         nullptr,
         nullptr,
         &si, &pi
     );
 
     if (!ok) {
-        DWORD err = GetLastError();
-        std::cerr << "[Lynx ERROR]: CreateProcess failed (" << err << ")\n";
+        std::cerr << "[Lynx ERROR]: CreateProcess failed (" << GetLastError() << ")\n";
         return 1;
     }
 
@@ -44,6 +44,14 @@ int run_command_no_batch(const std::string& cmd) {
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (hStdin != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hStdin, &mode)) {
+            SetConsoleMode(hStdin, mode | ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+        }
+    }
 
     return static_cast<int>(exit_code);
 }
@@ -89,7 +97,12 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
         for (const auto& key : dep_keys) {
             if (pkg_json.contains(key) && !pkg_json[key].empty()) {
                 for (auto& [name, version] : pkg_json[key].items()) {
-                    all_targets.push_back(name + "@" + version.get<std::string>());
+                    LockPackage lp;
+                    if (g_lockfile.get_package_info(name, lp) && !lp.version.empty()) {
+                        all_targets.push_back(name + "@" + lp.version);
+                    } else {
+                        all_targets.push_back(name + "@" + version.get<std::string>());
+                    }
                 }
             }
         }
@@ -99,15 +112,23 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
         } else {
             std::cout << "[Lynx]: Installing " << all_targets.size() << " packages...\n\n";
             installer.install_packages_parallel(all_targets);
-            std::cout << "\n[Lynx]: All packages installed.\n";
+            
+            installer.print_summary();
+
+            installer.run_all_pending_lifecycles();
         }
-        run_lifecycle_scripts(fs::current_path(), "root_project");
+        
+        run_lifecycle_scripts(fs::current_path(), "root_project", true);
     } else {
         if (target_packages.size() == 1) {
             installer.install_single_package(target_packages[0]);
         } else {
             installer.install_packages_parallel(target_packages);
         }
+
+        installer.print_summary();
+
+        installer.run_all_pending_lifecycles();
 
         std::string pkg_json_path = "package.json";
         if (fs::exists(pkg_json_path)) {
@@ -121,18 +142,22 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
 
                 for (const auto& raw_pkg : target_packages) {
                     std::string pkg_name = raw_pkg;
-                    std::string pkg_ver = "^latest";
+                    std::string pkg_ver = "";
 
                     size_t at_pos = raw_pkg.find('@');
                     if (at_pos == 0) at_pos = raw_pkg.find('@', 1);
 
                     if (at_pos != std::string::npos && at_pos > 0) {
                         pkg_name = raw_pkg.substr(0, at_pos);
-                        pkg_ver = "^" + raw_pkg.substr(at_pos + 1);
-                    }
-
-                    if (g_lockfile.has_package(pkg_name, "")) {
-                        std::map<std::string, std::string> deps = g_lockfile.get_dependencies(pkg_name);
+                        std::string raw_ver = raw_pkg.substr(at_pos + 1);
+                        pkg_ver = (raw_ver[0] == '^' || raw_ver[0] == '~') ? raw_ver : "^" + raw_ver;
+                    } else {
+                        LockPackage lp;
+                        if (g_lockfile.get_package_info(pkg_name, lp) && !lp.version.empty()) {
+                            pkg_ver = "^" + lp.version;
+                        } else {
+                            pkg_ver = "*";
+                        }
                     }
 
                     pkg_json[target_section][pkg_name] = pkg_ver;
@@ -152,6 +177,7 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
     std::cout << "[Lynx]: Updated lynx-lock.json\n";
     return 0;
 }
+
 int UninstallCommand::execute(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "[Lynx ERROR]: Please specify a package to uninstall!\n";
@@ -265,8 +291,10 @@ int CreateCommand::execute(const std::vector<std::string>& args) {
         return 1;
     }
 
-    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
+    installer.print_summary();
+    installer.run_all_pending_lifecycles();
 
+    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
     std::string bin_name = pkg_name; 
 
     std::string run_cmd = bin_name;
