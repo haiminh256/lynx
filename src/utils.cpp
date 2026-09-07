@@ -37,6 +37,38 @@ fs::path get_lynx_cache_dir() {
     return p;
 }
 
+fs::path get_global_dir() {
+    fs::path base;
+#ifdef _WIN32
+    if (const char* appdata = std::getenv("APPDATA"); appdata && *appdata) {
+        base = fs::path(appdata) / "lynx";
+    } else {
+        base = get_lynx_cache_dir() / "global";
+    }
+#else
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        base = fs::path(home) / ".lynx" / "global";
+    } else {
+        base = get_lynx_cache_dir() / "global";
+    }
+#endif
+    std::error_code ec;
+    fs::create_directories(base / "node_modules", ec);
+    return base;
+}
+
+fs::path get_global_bin_dir() {
+    fs::path gdir = get_global_dir();
+#ifdef _WIN32
+    return gdir; 
+#else
+    fs::path bin_p = gdir / "bin";
+    std::error_code ec;
+    fs::create_directories(bin_p, ec);
+    return bin_p;
+#endif
+}
+
 std::string sanitize_filename(std::string name) {
     for (char& c : name) {
         if (c == '/' || c == '\\' || c == '@' || c == ':' || c == '*') {
@@ -46,7 +78,7 @@ std::string sanitize_filename(std::string name) {
     return name;
 }
 
-void generate_bin_shims(const fs::path& package_path, const std::string& package_name) {
+void generate_bin_shims(const fs::path& package_path, const std::string& package_name, const fs::path& custom_bin_dir) {
     fs::path pkg_json_path = package_path / "package.json";
     if (!fs::exists(pkg_json_path)) return;
 
@@ -62,7 +94,7 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
 
     if (!pkg_json.contains("bin")) return;
 
-    fs::path bin_dir = fs::current_path() / "node_modules" / ".bin";
+    fs::path bin_dir = custom_bin_dir.empty() ? (fs::current_path() / "node_modules" / ".bin") : custom_bin_dir;
     std::error_code ec;
     fs::create_directories(bin_dir, ec);
 
@@ -71,22 +103,18 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
             fs::path cmd_path = bin_dir / (bin_name + ".cmd");
             std::ofstream cmd_file(cmd_path);
             if (cmd_file.is_open()) {
-                std::string current_nm = (fs::current_path() / "node_modules").string();
+                fs::path target_abs_pkg = package_path;
                 cmd_file << "@SETLOCAL\n";
                 cmd_file << "@IF NOT DEFINED NODE_PATH (\n";
-                cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name
-                         << "\\node_modules;" << current_nm << "\"\n";
+                cmd_file << "  @SET \"NODE_PATH=" << target_abs_pkg.string() << "\\node_modules\"\n";
                 cmd_file << ") ELSE (\n";
-                cmd_file << "  @SET \"NODE_PATH=" << current_nm << "\\" << package_name
-                         << "\\node_modules;" << current_nm << ";%NODE_PATH%\"\n";
+                cmd_file << "  @SET \"NODE_PATH=" << target_abs_pkg.string() << "\\node_modules;%NODE_PATH%\"\n";
                 cmd_file << ")\n";
                 cmd_file << "@IF EXIST \"%~dp0\\node.exe\" (\n";
-                cmd_file << "  \"%~dp0\\node.exe\"  \"%~dp0\\..\\" << package_name << "\\"
-                         << target_rel_path << "\" %*\n";
+                cmd_file << "  \"%~dp0\\node.exe\"  \"" << target_abs_pkg.string() << "\\" << target_rel_path << "\" %*\n";
                 cmd_file << ") ELSE (\n";
                 cmd_file << "  @SET PATHEXT=%PATHEXT:;.JS;=;%\n";
-                cmd_file << "  node  \"%~dp0\\..\\" << package_name << "\\" << target_rel_path
-                         << "\" %*\n";
+                cmd_file << "  node  \"" << target_abs_pkg.string() << "\\" << target_rel_path << "\" %*\n";
                 cmd_file << ")\n";
                 cmd_file.close();
             }
@@ -97,13 +125,10 @@ void generate_bin_shims(const fs::path& package_path, const std::string& package
             fs::path sh_path = bin_dir / bin_name;
             std::ofstream sh_file(sh_path);
             if (sh_file.is_open()) {
-                std::string current_nm = (fs::current_path() / "node_modules").string();
+                fs::path target_abs_pkg = package_path;
                 sh_file << "#!/bin/sh\n";
-                sh_file << "basedir=$(dirname \"$(realpath \"$0\" 2>/dev/null || echo \"$0\")\")\n";
-                sh_file << "export NODE_PATH=\"" << current_nm << "/" << package_name
-                        << "/node_modules:" << current_nm << "${NODE_PATH:+:$NODE_PATH}\"\n";
-                sh_file << "exec node \"$basedir/../" << package_name << "/" << target_rel_path
-                        << "\" \"$@\"\n";
+                sh_file << "export NODE_PATH=\"" << target_abs_pkg.string() << "/node_modules:${NODE_PATH:+:$NODE_PATH}\"\n";
+                sh_file << "exec node \"" << target_abs_pkg.string() << "/" << target_rel_path << "\" \"$@\"\n";
                 sh_file.close();
 
                 fs::permissions(sh_path,
@@ -137,6 +162,7 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         file >> pkg_json;
         file.close();
     } catch (...) {
+        if (file.is_open()) file.close();
         return true;
     }
 
@@ -279,6 +305,7 @@ bool import_package_to_cas(const fs::path& extracted_dir,
     std::ofstream out(index_path);
     if (!out) return false;
     out << j.dump(2);
+    out.close();
     return true;
 }
 
@@ -306,6 +333,7 @@ bool materialize_from_cas(const std::string& pkg_name,
         std::ifstream in(index_path);
         if (!in) return false;
         in >> j;
+        in.close();
     }
 
     if (fs::exists(target_dir, ec)) {

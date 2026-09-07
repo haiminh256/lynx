@@ -14,8 +14,12 @@ extern std::mutex install_mutex;
 constexpr int LYNX_MAX_PARALLEL = 30;
 
 fs::path get_lynx_cache_dir();
+
+fs::path get_global_dir();
+fs::path get_global_bin_dir();
+
 std::string sanitize_filename(std::string name);
-void generate_bin_shims(const fs::path& package_path, const std::string& package_name);
+void generate_bin_shims(const fs::path& package_path, const std::string& package_name, const fs::path& custom_bin_dir = {});
 
 bool run_lifecycle_scripts(const fs::path& package_path, const std::string& package_name, bool is_root = false);
 

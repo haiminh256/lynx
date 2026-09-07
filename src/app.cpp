@@ -4,8 +4,8 @@
 
 void CLIApp::print_usage() {
     std::cout << "[Lynx CLI]: Usage:\n"
-              << "  lynx install [package_name]\n"
-              << "  lynx uninstall <package_name>\n"
+              << "  lynx install [-g|--global] [-D|--save-dev] [package_name]\n"
+              << "  lynx uninstall [-g|--global] <package_name>\n"
               << "  lynx run [script_name]\n"
               << "  lynx create <template>[@version]\n";
 }

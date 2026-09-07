@@ -59,18 +59,27 @@ int run_command_no_batch(const std::string& cmd) {
 
 int InstallCommand::execute(const std::vector<std::string>& args) {
     PackageInstaller installer;
+    installer.clear_summary();
     bool is_dev = false;
+    bool is_global = false;
     std::vector<std::string> target_packages;
 
     for (const auto& arg : args) {
         if (arg == "-D" || arg == "--save-dev") {
             is_dev = true;
+        } else if (arg == "-g" || arg == "--global") {
+            is_global = true;
         } else {
             target_packages.push_back(arg);
         }
     }
 
     if (target_packages.empty()) {
+        if (is_global) {
+            std::cerr << "[Lynx ERROR]: Please specify packages to install globally!\n";
+            return 1;
+        }
+
         std::string pkg_json_path = "package.json";
         if (!fs::exists(pkg_json_path)) {
             std::cerr << "[Lynx ERROR]: No package.json found in current directory!\n";
@@ -111,88 +120,105 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
             std::cout << "[Lynx]: No dependencies found to install.\n";
         } else {
             std::cout << "[Lynx]: Installing " << all_targets.size() << " packages...\n\n";
-            installer.install_packages_parallel(all_targets);
+            installer.install_packages_parallel(all_targets, false);
             
             installer.print_summary();
-
             installer.run_all_pending_lifecycles();
         }
         
         run_lifecycle_scripts(fs::current_path(), "root_project", true);
     } else {
         if (target_packages.size() == 1) {
-            installer.install_single_package(target_packages[0]);
+            installer.install_single_package(target_packages[0], is_global);
         } else {
-            installer.install_packages_parallel(target_packages);
+            installer.install_packages_parallel(target_packages, is_global);
         }
 
         installer.print_summary();
-
         installer.run_all_pending_lifecycles();
 
-        std::string pkg_json_path = "package.json";
-        if (fs::exists(pkg_json_path)) {
-            std::ifstream file(pkg_json_path);
-            json pkg_json;
-            try {
-                file >> pkg_json;
-                file.close();
+        if (!is_global) {
+            std::string pkg_json_path = "package.json";
+            if (fs::exists(pkg_json_path)) {
+                std::ifstream file(pkg_json_path);
+                json pkg_json;
+                try {
+                    file >> pkg_json;
+                    file.close();
 
-                std::string target_section = is_dev ? "devDependencies" : "dependencies";
+                    std::string target_section = is_dev ? "devDependencies" : "dependencies";
 
-                for (const auto& raw_pkg : target_packages) {
-                    std::string pkg_name = raw_pkg;
-                    std::string pkg_ver = "";
+                    for (const auto& raw_pkg : target_packages) {
+                        std::string pkg_name = raw_pkg;
+                        std::string pkg_ver = "";
 
-                    size_t at_pos = raw_pkg.find('@');
-                    if (at_pos == 0) at_pos = raw_pkg.find('@', 1);
+                        size_t at_pos = raw_pkg.find('@');
+                        if (at_pos == 0) at_pos = raw_pkg.find('@', 1);
 
-                    if (at_pos != std::string::npos && at_pos > 0) {
-                        pkg_name = raw_pkg.substr(0, at_pos);
-                        std::string raw_ver = raw_pkg.substr(at_pos + 1);
-                        pkg_ver = (raw_ver[0] == '^' || raw_ver[0] == '~') ? raw_ver : "^" + raw_ver;
-                    } else {
-                        LockPackage lp;
-                        if (g_lockfile.get_package_info(pkg_name, lp) && !lp.version.empty()) {
-                            pkg_ver = "^" + lp.version;
+                        if (at_pos != std::string::npos && at_pos > 0) {
+                            pkg_name = raw_pkg.substr(0, at_pos);
+                            std::string raw_ver = raw_pkg.substr(at_pos + 1);
+                            pkg_ver = (raw_ver[0] == '^' || raw_ver[0] == '~') ? raw_ver : "^" + raw_ver;
                         } else {
-                            pkg_ver = "*";
+                            LockPackage lp;
+                            if (g_lockfile.get_package_info(pkg_name, lp) && !lp.version.empty()) {
+                                pkg_ver = "^" + lp.version;
+                            } else {
+                                pkg_ver = "*";
+                            }
                         }
+
+                        pkg_json[target_section][pkg_name] = pkg_ver;
                     }
 
-                    pkg_json[target_section][pkg_name] = pkg_ver;
+                    std::ofstream out_file(pkg_json_path);
+                    out_file << pkg_json.dump(2) << std::endl;
+                    out_file.close();
+                    std::cout << "[Lynx]: Saved to " << target_section << " in package.json\n";
+                } catch (...) {
+                    std::cerr << "[Lynx WARNING]: Failed to update package.json\n";
                 }
-
-                std::ofstream out_file(pkg_json_path);
-                out_file << pkg_json.dump(2) << std::endl;
-                out_file.close();
-                std::cout << "[Lynx]: Saved to " << target_section << " in package.json\n";
-            } catch (...) {
-                std::cerr << "[Lynx WARNING]: Failed to update package.json\n";
             }
         }
     }
 
-    g_lockfile.save();
-    std::cout << "[Lynx]: Updated lynx-lock.json\n";
+    if (!is_global) {
+        g_lockfile.save();
+        std::cout << "[Lynx]: Updated lynx-lock.json\n";
+    }
     return 0;
 }
 
 int UninstallCommand::execute(const std::vector<std::string>& args) {
-    if (args.empty()) {
+    bool is_global = false;
+    std::vector<std::string> target_packages;
+
+    for (const auto& arg : args) {
+        if (arg == "-g" || arg == "--global") {
+            is_global = true;
+        } else {
+            target_packages.push_back(arg);
+        }
+    }
+
+    if (target_packages.empty()) {
         std::cerr << "[Lynx ERROR]: Please specify a package to uninstall!\n";
         return 1;
     }
 
-    std::string target_package = args[0];
-    fs::path target_path = fs::current_path() / "node_modules" / target_package;
+    std::string target_package = target_packages[0];
+    fs::path target_base_nm = is_global ? (get_global_dir() / "node_modules") : (fs::current_path() / "node_modules");
+    fs::path target_path = target_base_nm / target_package;
 
     if (fs::exists(target_path) || fs::is_symlink(target_path)) {
-        std::cout << "[Lynx]: Removing " << target_package << "...\n";
-        fs::remove_all(target_path);
+        std::cout << "[Lynx]: Removing " << target_package << (is_global ? " globally..." : "...") << "\n";
+        std::error_code ec;
+        fs::remove_all(target_path, ec);
 
-        g_lockfile.remove_package(target_package);
-        g_lockfile.save();
+        if (!is_global) {
+            g_lockfile.remove_package(target_package);
+            g_lockfile.save();
+        }
 
         std::cout << "[Lynx]: Successfully uninstalled " << target_package << ".\n";
     } else {
