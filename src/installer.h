@@ -6,7 +6,6 @@
 #include <utility>
 #include <map>
 #include <set>
-#include <mutex>
 
 namespace fs = std::filesystem;
 
@@ -21,8 +20,11 @@ struct TempFileCleaner {
 };
 
 struct InstallContext {
-    fs::path parent_node_modules; 
-    bool is_direct = true;        
+    bool is_direct = true;
+    // Khi true: cho phép ghi đè version đã có (dùng cho dependency
+    // của một direct package đang được cài/upgrade).
+    bool allow_overwrite = false;
+    std::vector<std::string> chain;
 };
 
 class PackageInstaller {
@@ -44,5 +46,16 @@ private:
     std::vector<std::pair<fs::path, std::string>> pending_lifecycle_packages;
     std::vector<std::string> skipped_packages;
     std::vector<std::string> installed_summary_packages;
-    std::set<std::string> in_progress_packages; 
+
+    std::set<std::string> in_progress_targets;
+
+    struct ClaimGuard {
+        PackageInstaller* self;
+        std::string key;
+        bool active;
+        ClaimGuard(PackageInstaller* s, std::string k) : self(s), key(std::move(k)), active(true) {}
+        ClaimGuard(const ClaimGuard&) = delete;
+        ClaimGuard& operator=(const ClaimGuard&) = delete;
+        ~ClaimGuard();
+    };
 };

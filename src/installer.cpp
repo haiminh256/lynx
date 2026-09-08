@@ -19,6 +19,13 @@ using json = nlohmann::json;
 
 static std::atomic<uint64_t> g_temp_counter{0};
 
+PackageInstaller::ClaimGuard::~ClaimGuard() {
+    if (active) {
+        std::lock_guard<std::mutex> lock(install_mutex);
+        self->in_progress_targets.erase(key);
+    }
+}
+
 struct SemVer {
     int major = 0, minor = 0, patch = 0;
     bool is_prerelease = false;
@@ -108,11 +115,63 @@ static std::string resolve_best_version(const json& parsed_data, const std::stri
     }
     if (!best.empty()) return best;
 
-    if (parsed_data.contains("dist-tags") && parsed_data["dist-tags"].contains("latest")) {
-        return parsed_data["dist-tags"]["latest"].get<std::string>();
+    for (auto it = parsed_data["versions"].rbegin(); it != parsed_data["versions"].rend(); ++it) {
+        SemVer curr = SemVer::parse(it.key());
+        if (curr.is_prerelease && !want_pre) continue;
+        return it.key();
+    }
+    return parsed_data["versions"].rbegin().key();
+}
+
+static bool version_satisfies_range(const std::string& version_str, const std::string& range_req) {
+    std::string range = range_req;
+    range.erase(std::remove_if(range.begin(), range.end(), ::isspace), range.end());
+
+    if (range.empty() || range == "*" || range == "latest" || range == "x" || range == "X") return true;
+    if (range == version_str) return true;
+
+    std::string op = "^";
+    std::string clean = range;
+    if (clean.rfind(">=", 0) == 0)      { op = ">="; clean = clean.substr(2); }
+    else if (clean.rfind("<=", 0) == 0) { op = "<="; clean = clean.substr(2); }
+    else if (clean.rfind(">", 0) == 0)  { op = ">";  clean = clean.substr(1); }
+    else if (clean.rfind("<", 0) == 0)  { op = "<";  clean = clean.substr(1); }
+    else if (!clean.empty() && (clean[0]=='^'||clean[0]=='~'||clean[0]=='=')) {
+        op = std::string(1, clean[0]);
+        clean = clean.substr(1);
     }
 
-    return parsed_data["versions"].rbegin().key();
+    SemVer target = SemVer::parse(clean);
+    SemVer curr = SemVer::parse(version_str);
+
+    bool want_pre = target.is_prerelease || (range.find('-') != std::string::npos);
+    if (curr.is_prerelease && !want_pre) return false;
+
+    if (op == "^")  return curr.major == target.major && curr >= target;
+    if (op == "~")  return curr.major == target.major && curr.minor == target.minor && curr.patch >= target.patch;
+    if (op == "=")  return curr == target;
+    if (op == ">=") return curr >= target;
+    if (op == ">")  return curr > target;
+    if (op == "<=") return !(curr > target);
+    if (op == "<")  return target > curr;
+    return false;
+}
+
+static std::string read_installed_version(const fs::path& package_dir) {
+    std::error_code ec;
+    fs::path pj = package_dir / "package.json";
+    if (!fs::exists(pj, ec)) return "";
+
+    std::ifstream f(pj);
+    if (!f) return "";
+    try {
+        json j;
+        f >> j;
+        if (j.contains("version") && j["version"].is_string()) {
+            return j["version"].get<std::string>();
+        }
+    } catch (...) {}
+    return "";
 }
 
 std::string PackageInstaller::make_unique_temp(const std::string& package_name) {
@@ -136,7 +195,6 @@ void PackageInstaller::clear_summary() {
     skipped_packages.clear();
     installed_summary_packages.clear();
     pending_lifecycle_packages.clear();
-    in_progress_packages.clear();
 }
 
 bool PackageInstaller::install_single_package(const std::string& raw_input, bool is_global,
@@ -151,50 +209,38 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
         requested_version = raw_input.substr(at + 1);
     }
 
-    // Luôn luôn lấy thư mục node_modules chính (Flat Layout)
-    fs::path target_base;
-    if (is_global) {
-        target_base = get_global_dir() / "node_modules";
-    } else {
-        target_base = fs::current_path() / "node_modules";
-    }
-
-    fs::path target_path = target_base / package_name;
-    std::error_code ec;
-
-    {
+    // Circular dependency
+    if (std::find(ctx.chain.begin(), ctx.chain.end(), package_name) != ctx.chain.end()) {
         std::lock_guard<std::mutex> lock(install_mutex);
-        if (in_progress_packages.count(package_name)) {
-            return true; 
-        }
-        in_progress_packages.insert(package_name);
-    }
-
-    struct ProgressGuard {
-        std::string name;
-        PackageInstaller* self;
-        ~ProgressGuard() {
-            std::lock_guard<std::mutex> lock(install_mutex);
-            self->in_progress_packages.erase(name);
-        }
-    } guard{package_name, this};
-
-    if (fs::exists(target_path, ec)) {
-        {
-            std::lock_guard<std::mutex> lock(install_mutex);
-            skipped_packages.push_back(package_name + (requested_version.empty() ? "" : "@" + requested_version));
-        }
+        std::cout << "[Lynx]: Circular dependency on \"" << package_name << "\" — skipping.\n";
+        skipped_packages.push_back(package_name + " (circular)");
         return true;
     }
 
+    fs::path target_base = is_global ? (get_global_dir() / "node_modules")
+                                      : (fs::current_path() / "node_modules");
+    fs::path target_path = target_base / package_name;
+    std::error_code ec;
+
+    // Claim target path (TOCTOU)
+    std::string claim_key = target_path.string();
+    {
+        std::lock_guard<std::mutex> lock(install_mutex);
+        if (in_progress_targets.count(claim_key)) return true;
+        in_progress_targets.insert(claim_key);
+    }
+    ClaimGuard claim_guard(this, claim_key);
+
+    // Resolve version + metadata
     std::string target_version, tarball_url, integrity;
     std::map<std::string, std::string> dep_map;
 
     LockPackage locked;
-
-    if (!is_global && g_lockfile.get_package_info(package_name, locked) &&
+    bool have_locked_match = !is_global && g_lockfile.get_package_info(package_name, locked) &&
         (requested_version.empty() || requested_version == "*" || requested_version == "latest" ||
-         locked.version == requested_version)) {
+         version_satisfies_range(locked.version, requested_version));
+
+    if (have_locked_match) {
         target_version = locked.version;
         tarball_url = locked.resolved;
         integrity = locked.integrity;
@@ -204,7 +250,8 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
         TempFileCleaner cleaner{tmp};
         std::string url = "https://registry.npmjs.org/" + package_name;
 
-        std::string cmd = "curl -s -L -H \"Accept: application/vnd.npm.install-v1+json\" \"" + url + "\" -o \"" + tmp + "\"";
+        std::string cmd = "curl -s -L -H " + shell_quote("Accept: application/vnd.npm.install-v1+json") +
+                           " " + shell_quote(url) + " -o " + shell_quote(tmp);
         if (std::system(cmd.c_str()) != 0 || !fs::exists(tmp, ec) || fs::file_size(tmp, ec) == 0) {
             std::lock_guard<std::mutex> lock(install_mutex);
             std::cerr << "[Lynx ERROR]: Package " << package_name << " not found\n";
@@ -215,7 +262,6 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
             json meta;
             std::ifstream f(tmp);
             f >> meta;
-            f.close();
             safe_remove(tmp);
 
             target_version = resolve_best_version(meta, requested_version);
@@ -239,11 +285,35 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
                     dep_map[k] = v.get<std::string>();
             }
         } catch (...) {
-            safe_remove(tmp);
             return false;
         }
     }
 
+    // Conflict / up-to-date check
+    {
+        std::lock_guard<std::mutex> lock(install_mutex);
+        std::string installed_version = read_installed_version(target_path);
+        if (!installed_version.empty()) {
+            if (installed_version == target_version) {
+                skipped_packages.push_back(package_name + "@" + target_version + " (up to date)");
+                return true;
+            }
+
+            // Chỉ skip khi là transitive THUẦN (không được phép overwrite)
+            if (!ctx.is_direct && !ctx.allow_overwrite) {
+                std::cerr << "[Lynx WARNING]: " << package_name << "@" << installed_version
+                          << " is already installed; skipping conflicting request for "
+                          << package_name << "@" << target_version
+                          << " (flat install — first resolved version wins)\n";
+                skipped_packages.push_back(package_name + "@" + target_version +
+                                            " (conflict, kept " + installed_version + ")");
+                return true;
+            }
+            // is_direct hoặc allow_overwrite → fall through, upgrade
+        }
+    }
+
+    // Dedup trong cùng phiên
     std::string resolved_key = target_path.string() + "@" + target_version;
     {
         std::lock_guard<std::mutex> lock(install_mutex);
@@ -251,6 +321,7 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
         installed_packages.insert(resolved_key);
     }
 
+    // Download + CAS
     bool need_download = !is_package_in_cas(package_name, target_version);
     if (need_download) {
         fs::path cache_dir = get_lynx_cache_dir();
@@ -264,7 +335,7 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
                 std::cout << "[Lynx]: Fetching " << package_name << "@" << target_version << "...\n" << std::flush;
             }
             fs::path tmp_tgz = cache_dir / (archive + ".part." + std::to_string(g_temp_counter.fetch_add(1)));
-            std::string dl = "curl -s -L \"" + tarball_url + "\" -o \"" + tmp_tgz.string() + "\"";
+            std::string dl = "curl -s -L " + shell_quote(tarball_url) + " -o " + shell_quote(tmp_tgz.string());
             if (std::system(dl.c_str()) != 0 || !fs::exists(tmp_tgz, ec)) {
                 safe_remove(tmp_tgz);
                 return false;
@@ -277,7 +348,8 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
             if (fs::exists(extract_dir, ec)) fs::remove_all(extract_dir, ec);
             fs::create_directories(extract_dir, ec);
 
-            std::string tar = "tar -xzf \"" + tgz.string() + "\" -C \"" + extract_dir.string() + "\" --strip-components=1";
+            std::string tar = "tar -xzf " + shell_quote(tgz.string()) + " -C " + shell_quote(extract_dir.string()) +
+                               " --strip-components=1";
             if (std::system(tar.c_str()) != 0) {
                 fs::remove_all(extract_dir, ec);
                 return false;
@@ -290,11 +362,10 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
         }
     }
 
+    // Materialize
     {
         std::lock_guard<std::mutex> lock(install_mutex);
         if (fs::exists(target_path, ec)) fs::remove_all(target_path, ec);
-
-        fs::create_directories(target_path.parent_path(), ec);
 
         if (!materialize_from_cas(package_name, target_version, target_path)) {
             std::cerr << "[Lynx ERROR]: Materialize failed: " << package_name << "\n";
@@ -318,10 +389,13 @@ bool PackageInstaller::install_single_package(const std::string& raw_input, bool
         g_lockfile.add_package(package_name, target_version, tarball_url, integrity, dep_map);
     }
 
-    // Cài đặt phẳng cho các dependencies con (Gom chung về node_modules chính)
+    // Dependency con — kế thừa quyền overwrite từ cha
     if (!dep_map.empty()) {
         InstallContext child_ctx;
         child_ctx.is_direct = false;
+        child_ctx.allow_overwrite = ctx.is_direct || ctx.allow_overwrite;
+        child_ctx.chain = ctx.chain;
+        child_ctx.chain.push_back(package_name);
 
         std::vector<std::string> child_deps;
         for (const auto& [n, v] : dep_map) {

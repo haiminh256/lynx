@@ -106,12 +106,25 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
         for (const auto& key : dep_keys) {
             if (pkg_json.contains(key) && !pkg_json[key].empty()) {
                 for (auto& [name, version] : pkg_json[key].items()) {
-                    LockPackage lp;
-                    if (g_lockfile.get_package_info(name, lp) && !lp.version.empty()) {
-                        all_targets.push_back(name + "@" + lp.version);
-                    } else {
-                        all_targets.push_back(name + "@" + version.get<std::string>());
-                    }
+                    // FIX (bumped package.json range gets ignored forever):
+                    // this used to prefer the version already pinned in
+                    // lynx-lock.json over whatever range package.json
+                    // actually declares, unconditionally. So bumping e.g.
+                    // "vue": "^3.5.0" to "^3.6.0-rc.7" in package.json had
+                    // no effect — the lockfile's old entry always won, and
+                    // the installer's own lockfile-vs-request check (in
+                    // installer.cpp) never even got a chance to see the new
+                    // range, since the "request" it received here already
+                    // *was* the stale locked version.
+                    //
+                    // The fix is to always pass the range from package.json
+                    // as-is. install_single_package() is responsible for
+                    // deciding whether the lockfile's pinned version still
+                    // satisfies that range (fast path, no network call) or
+                    // whether it needs to re-resolve against the registry
+                    // (e.g. because the range changed) — that's the correct
+                    // place for that decision, not here.
+                    all_targets.push_back(name + "@" + version.get<std::string>());
                 }
             }
         }
@@ -123,6 +136,7 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
             installer.install_packages_parallel(all_targets, false);
             
             installer.print_summary();
+
             installer.run_all_pending_lifecycles();
         }
         
@@ -135,6 +149,7 @@ int InstallCommand::execute(const std::vector<std::string>& args) {
         }
 
         installer.print_summary();
+
         installer.run_all_pending_lifecycles();
 
         if (!is_global) {
@@ -212,8 +227,7 @@ int UninstallCommand::execute(const std::vector<std::string>& args) {
 
     if (fs::exists(target_path) || fs::is_symlink(target_path)) {
         std::cout << "[Lynx]: Removing " << target_package << (is_global ? " globally..." : "...") << "\n";
-        std::error_code ec;
-        fs::remove_all(target_path, ec);
+        fs::remove_all(target_path);
 
         if (!is_global) {
             g_lockfile.remove_package(target_package);

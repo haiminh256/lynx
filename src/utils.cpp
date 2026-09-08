@@ -60,7 +60,7 @@ fs::path get_global_dir() {
 fs::path get_global_bin_dir() {
     fs::path gdir = get_global_dir();
 #ifdef _WIN32
-    return gdir; 
+    return gdir; // Trên Windows tạo shims trực tiếp tại %APPDATA%/lynx
 #else
     fs::path bin_p = gdir / "bin";
     std::error_code ec;
@@ -76,6 +76,40 @@ std::string sanitize_filename(std::string name) {
         }
     }
     return name;
+}
+
+std::string shell_quote(const std::string& s) {
+#ifdef _WIN32
+    // Best-effort cmd.exe quoting: wrap in double quotes and double up any
+    // embedded double quotes. cmd.exe has no fully safe quoting mode (things
+    // like %VAR%, ^, &, | can still be interpreted in some contexts), so this
+    // is defense in depth, not a guarantee. Prefer CreateProcess with an
+    // argv array over a composed command-line string when possible.
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') {
+            out += "\"\"";
+        } else {
+            out += c;
+        }
+    }
+    out += "\"";
+    return out;
+#else
+    // POSIX single-quote escaping is airtight: everything inside single
+    // quotes is literal except a single quote itself, which we close out
+    // of, escape, and reopen.
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+#endif
 }
 
 void generate_bin_shims(const fs::path& package_path, const std::string& package_name, const fs::path& custom_bin_dir) {
@@ -162,7 +196,6 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
         file >> pkg_json;
         file.close();
     } catch (...) {
-        if (file.is_open()) file.close();
         return true;
     }
 
@@ -194,6 +227,13 @@ bool run_lifecycle_scripts(const fs::path& package_path, const std::string& pack
             std::cout << "[Lynx]: Running " << script_name << " for " << package_name << "...\n" << std::flush;
         }
 
+        // NOTE: script_cmd here is the package-author-supplied lifecycle
+        // command (e.g. "node-gyp rebuild"), which is *intentionally*
+        // executed via the shell — that's how npm lifecycle scripts work
+        // too, and packages rely on shell features (&&, env expansion,
+        // etc.) in these strings. This is a different trust boundary than
+        // the registry-controlled tarball URLs fixed elsewhere: installing
+        // a package already implies running its scripts.
 #ifdef _WIN32
         std::string path_for_child = bin_dir.string() + ";" + old_path;
         _putenv_s("PATH", path_for_child.c_str());
@@ -305,7 +345,6 @@ bool import_package_to_cas(const fs::path& extracted_dir,
     std::ofstream out(index_path);
     if (!out) return false;
     out << j.dump(2);
-    out.close();
     return true;
 }
 
@@ -316,6 +355,28 @@ bool is_package_in_cas(const std::string& pkg_name, const std::string& version) 
     return fs::exists(index_path, ec);
 }
 
+// FIX (CAS writability / corruption bug), hardlink restored: this function
+// hard-links each file from the content-addressed store into the package's
+// node_modules directory (falling back to a real copy when hard links
+// aren't possible — e.g. store and target on different filesystems, or an
+// FS that doesn't support them). A hard link makes `dest` and `store_file`
+// the SAME inode, so the previous version of this code — which then added
+// the owner-write permission bit to `dest` — was also making the shared,
+// immutable store blob writable under its original hash-named path. Any
+// package (or its postinstall script) writing to one of its own files would
+// silently corrupt that blob for every other package/project on the
+// machine that happens to hash to the same content.
+//
+// The fix keeps the hard-link speed/space win but makes materialized files
+// READ-ONLY, whether they ended up hard-linked or copied. This is the same
+// trade-off pnpm makes for its hardlinked store: package files are treated
+// as immutable published content. A script that wants to write build
+// output should create a NEW file in the package directory (which is
+// itself a normal writable directory) rather than overwrite an existing
+// published file in place. Tools that specifically need to mutate
+// installed files (e.g. patch-package-style workflows) would need an
+// explicit "copy mode" that skips this read-only step — worth adding as an
+// opt-in flag if you need that, but it should not be the default.
 bool materialize_from_cas(const std::string& pkg_name,
                           const std::string& version,
                           const fs::path& target_dir) {
@@ -333,7 +394,6 @@ bool materialize_from_cas(const std::string& pkg_name,
         std::ifstream in(index_path);
         if (!in) return false;
         in >> j;
-        in.close();
     }
 
     if (fs::exists(target_dir, ec)) {
@@ -351,6 +411,9 @@ bool materialize_from_cas(const std::string& pkg_name,
         fs::create_directories(dest.parent_path(), ec);
 
         if (fs::exists(dest, ec)) {
+            // dest may be left over read-only from a previous materialize;
+            // make sure we're allowed to replace it (matters on Windows,
+            // where the read-only attribute blocks deletion outright).
             fs::permissions(dest, fs::perms::owner_write, fs::perm_options::add, ec);
             fs::remove(dest, ec);
         }
@@ -359,6 +422,9 @@ bool materialize_from_cas(const std::string& pkg_name,
         fs::create_hard_link(store_file, dest, ec);
 
         if (ec) {
+            // Cross-device link, or a filesystem that doesn't support hard
+            // links at all (some network shares, FAT-family filesystems).
+            // Fall back to a real copy — still safe, just slower.
             ec.clear();
             fs::copy_file(store_file, dest, fs::copy_options::overwrite_existing, ec);
             if (ec) {
@@ -367,7 +433,13 @@ bool materialize_from_cas(const std::string& pkg_name,
             }
         }
 
-        fs::permissions(dest, fs::perms::owner_write, fs::perm_options::add, ec);
+        // Deliberately read-only, not owner-write: see the function
+        // comment above. This is what prevents a hard-linked file from
+        // corrupting the shared store when something writes into
+        // node_modules.
+        fs::permissions(dest,
+            fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read,
+            fs::perm_options::replace, ec);
     }
     return true;
 }
