@@ -1,4 +1,1 @@
-/.ccls-cache/
-/src/*.o
-*.exe
-lynx
+/target
