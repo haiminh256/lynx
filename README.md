@@ -27,4 +27,4 @@
 ```bash
 git clone https://github.com/haiminh256/lynx.git
 cd lynx
-cargo build
+cargo build --release
